@@ -1,0 +1,5 @@
+FROM qwen3.5:9b
+
+# Cap context to 16K to fit within 8GB VRAM with headroom
+# Benchmark: 6.46 GB VRAM at 16K vs 7.13 GB at 32K
+PARAMETER num_ctx 16384
