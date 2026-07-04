@@ -145,6 +145,7 @@ msg = client.messages.create(
 - **[Providers](documentation/providers.md)** — sign-up links, capabilities, rate limits
 - **[Monitoring](documentation/monitoring.md)** — `cascade status`, Prometheus `/metrics`, `/v1/status`
 - **[Build an agent](documentation/build-an-agent.md)** — chatbot → memory → tools
+- **[Concepts](documentation/concepts.md)** — plain-language glossary of every term you'll encounter
 
 ## License
 
