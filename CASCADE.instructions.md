@@ -26,4 +26,4 @@ pytest
 
 ## Source of Truth
 
-This directory is canonically in the `hermes` monorepo but was imported from its own git repo (`cascade`). Full history preserved via git subtree. If this project is ever extracted to its own public repo, use `git subtree split`.
+This directory is canonically in the **polaris** monorepo but was imported from its own git repo (`cascade`). Full history preserved via git subtree. If this project is ever extracted to its own public repo, use `git subtree split`.
