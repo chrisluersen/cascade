@@ -4,7 +4,7 @@ venv/
 *.log
 *.log.old
 router_state.json
+cascade_state.json
 .watchdog_state
-autostart.log
 .env
 auth.json

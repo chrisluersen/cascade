@@ -5,7 +5,7 @@ Applied when editing files under `cascade/`.
 ## Project Identity
 
 Local LLM proxy with smart provider cascade, failover, and credential pooling.
-Maintained by Chris. May go public in the future.
+Maintained by Chris. Public project since 2026-07-13.
 
 ## Conventions
 
@@ -26,4 +26,4 @@ pytest
 
 ## Source of Truth
 
-This directory is canonically in the **polaris** monorepo but was imported from its own git repo (`cascade`). Full history preserved via git subtree. If this project is ever extracted to its own public repo, use `git subtree split`.
+This directory is the canonical source for cascade. Imported from its own git repo with full history preserved via git subtree. The public repo at `github.com/chrisluersen/cascade` is synced from here via `git subtree push`.
