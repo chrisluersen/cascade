@@ -66,7 +66,7 @@ _HTTP.mount("https://", _http_adapter)
 _HTTP.mount("http://", _http_adapter)
 
 PORT              = int(os.environ.get("PORT", 8319))
-CASCADE_API_KEY    = [k.strip() for k in os.environ.get("CASCADE_API_KEY", "sk-cascade-1").split(",") if k.strip()]
+CASCADE_API_KEY    = [k.strip() for k in os.environ.get("CASCADE_API_KEY", "sk-cascade-14a70fb6aac62ab767d00f628fffaf85").split(",") if k.strip()]
 CASCADE_MODEL      = os.environ.get("CASCADE_MODEL_ID", "cascade")
 CACHE_TTL         = int(os.environ.get("CACHE_TTL_SECONDS", 600))   # 0 = disabled
 CACHE_MAX_SIZE    = int(os.environ.get("CACHE_MAX_SIZE", 500))
