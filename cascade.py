@@ -2276,8 +2276,13 @@ def _auth_check():
     if not token:
         # The Anthropic SDK sends the key via x-api-key, not Authorization.
         token = request.headers.get("x-api-key", "").strip()
+    # Accept keys from both environment and Bitwarden so CASCADE_API_KEY
+    # doesn't need to live in any .env file — Bitwarden is the SSOT.
+    valid_keys = set(CASCADE_API_KEY)
+    if _BW_KEYS and _BW_KEYS.get("CASCADE_API_KEY"):
+        valid_keys.add(_BW_KEYS["CASCADE_API_KEY"])
     # compare_digest keeps the comparison constant-time per key
-    if not any(hmac.compare_digest(token, k) for k in CASCADE_API_KEY):
+    if not any(hmac.compare_digest(token, k) for k in valid_keys):
         return jsonify({"error": "unauthorized"}), 401
 
 
