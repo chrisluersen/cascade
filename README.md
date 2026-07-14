@@ -146,6 +146,7 @@ msg = client.messages.create(
 - **[Monitoring](documentation/monitoring.md)** — `cascade status`, Prometheus `/metrics`, `/v1/status`
 - **[Build an agent](documentation/build-an-agent.md)** — chatbot → memory → tools
 - **[Concepts](documentation/concepts.md)** — plain-language glossary of every term you'll encounter
+- **[Routing spec](documentation/routing-spec.md)** — provider cascade, timeouts, model selection
 
 ## License
 
