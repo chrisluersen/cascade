@@ -66,7 +66,7 @@ _HTTP.mount("https://", _http_adapter)
 _HTTP.mount("http://", _http_adapter)
 
 PORT              = int(os.environ.get("PORT", 8319))
-PROXY_API_KEYS    = [k.strip() for k in os.environ.get("PROXY_API_KEYS", "sk-cascade-1").split(",") if k.strip()]
+CASCADE_API_KEY    = [k.strip() for k in os.environ.get("CASCADE_API_KEY", "sk-cascade-1").split(",") if k.strip()]
 CASCADE_MODEL      = os.environ.get("CASCADE_MODEL_ID", "cascade")
 CACHE_TTL         = int(os.environ.get("CACHE_TTL_SECONDS", 600))   # 0 = disabled
 CACHE_MAX_SIZE    = int(os.environ.get("CACHE_MAX_SIZE", 500))
@@ -2277,7 +2277,7 @@ def _auth_check():
         # The Anthropic SDK sends the key via x-api-key, not Authorization.
         token = request.headers.get("x-api-key", "").strip()
     # compare_digest keeps the comparison constant-time per key
-    if not any(hmac.compare_digest(token, k) for k in PROXY_API_KEYS):
+    if not any(hmac.compare_digest(token, k) for k in CASCADE_API_KEY):
         return jsonify({"error": "unauthorized"}), 401
 
 
