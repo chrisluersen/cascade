@@ -12,9 +12,12 @@ A lightweight OpenAI-compatible proxy that:
   - Tracks per-provider latency and error rates
 
 Supported providers (configure via .env or auth.json):
-  Free:  Gemini · OpenRouter · SambaNova · GitHub Models · Cerebras · Groq · Mistral · Cohere · Z.ai · Naga · NVIDIA NIM · Ollama
-    Paid:  OpenAI · Anthropic
-    Credit: Nous Portal (subscription credits)
+  Free (OpenRouter):  Cohere · Cerebras · Nvidia · Mistral · SambaNova
+  Free (direct):      Nvidia NIM · SambaNova Direct · Groq · GitHub Models · Gemini
+  Free (direct):      Together · LLM7.io · OVHcloud · LongCat · SiliconFlow · AI Hub Mix · Aion Labs
+  Free (native):      Z.ai (GLM) · Naga AI · DeepInfra · Fireworks · HuggingFace
+  Local:              Ollama
+  Paid:               OpenAI · Anthropic · OpenRouter (paid models) · Nous Portal
 
 Quick start:
   pip install -r requirements.txt
@@ -22,7 +25,7 @@ Quick start:
   python cascade.py
 """
 
-import json, os, time, threading, logging, hashlib, hmac, itertools
+import json, os, time, threading, logging, hashlib, hmac, itertools, uuid as _uuid, subprocess, shutil
 from pathlib import Path
 from collections import deque, OrderedDict
 from flask import Flask, request, jsonify, Response, stream_with_context
@@ -106,10 +109,98 @@ def _pick_model_by_prompt(messages: list) -> str | None:
     return None
 
 
-FAST_ROUTE_TOKENS = int(os.environ.get("FAST_ROUTE_THRESHOLD", 0))  # 0 = disabled
+FAST_ROUTE_TOKENS = int(os.environ.get("FAST_ROUTE_THRESHOLD", 200)) # 0 = disabled, 50-200 recommended
 STATE_FILE        = Path(os.environ.get("CASCADE_STATE_FILE", "./cascade_state.json"))
 STATE_TTL_HOURS   = int(os.environ.get("CASCADE_STATE_TTL_HOURS", 24))  # 0 = re-probe every start
 AUTH_FILE         = Path(os.environ.get("CASCADE_AUTH_FILE", "./auth.json"))  # cascade's own key store
+
+# ── Cost tracking (USD per 1M tokens) ──────────────────────────────────────
+# Input/output pricing for every model cascade routes through. Missing entries
+# fall back to $0 (free-tier safe default). Sourced from provider pricing pages
+# and OpenRouter pricing (2026-07).
+# Usage is tracked per-provider and exposed at /v1/status + /metrics.
+KNOWN_MODEL_COSTS: dict = {
+    # Google — all free tier
+    "gemini-2.5-flash-lite":        (0.0,    0.0),
+    "gemini-2.5-flash":             (0.0,    0.0),      # free on free tier
+    "gemini-embedding-001":         (0.0,    0.0),
+
+    # OpenAI via GitHub — free
+    "gpt-4o":                       (0.0,    0.0),      # free via GitHub Models
+    "gpt-4o-mini":                  (0.0,    0.0),      # free via GitHub Models
+
+    # Groq — free tier
+    "llama-3.3-70b-versatile":      (0.0,    0.0),
+
+    # Direct free providers
+    "gpt-oss-120b":                 (0.0,    0.0),      # ovhcloud, cerebras free
+    "DeepSeek-V3.2":                (0.0,    0.0),      # sambanova free
+    "DeepSeek-V2.5":                (0.0,    0.0),      # siliconflow free
+    "nemotron-3-super-120b-a12b":   (0.0,    0.0),      # nvidia_nim free
+    "nemotron-3-ultra-550b-a55b:free": (0.0, 0.0),      # OpenRouter free
+    "nemotron-3-super-120b-a12b:free": (0.0, 0.0),      # naga free, OpenRouter fallback
+    "openai/gpt-oss-120b:cheapest": (0.0,    0.0),      # huggingface free
+    "Qwen/Qwen2.5-72B-Instruct":    (0.0,    0.0),      # deepinfra free
+    "accounts/fireworks/models/qwen2p5-coder-32b-instruct": (0.0, 0.0),  # fireworks free
+    "LongCat-2.0":                  (0.0,    0.0),
+    "coding-glm-5.2-free":          (0.0,    0.0),      # aihubmix free
+    "glm-4.5-flash":                (0.0,    0.0),      # z.ai free (1000 req/day)
+    "ng-nemotron-3-super":          (0.0,    0.0),      # naga free
+    "aion-2.5":                     (0.0,    0.0),      # aion free
+
+    # OpenRouter models (shared key, various pricing)
+    "cohere/command-a-03-2025":     (0.0,    0.0),      # free tier
+    "mistral/mistral-medium-latest":(0.0,    0.0),      # free tier
+    "cerebras/gpt-oss-120b":        (0.0,    0.0),      # free tier
+    "sambanova/DeepSeek-V3.2":      (0.0,    0.0),      # free tier
+    "nvidia/deepseek-ai/deepseek-v4-flash": (0.0, 0.0), # free on OR
+
+    # Paid OpenRouter models
+    "deepseek/deepseek-v4-flash":   (0.098,  0.196),    # daily driver, cheapest paid
+    "deepseek/deepseek-v4-pro":     (0.435,  0.87),     # frontier
+    "tencent/hy3-preview":          (0.063,  0.21),     # cheapest reasoning
+    "xiaomi/mimo-v2.5":             (0.105,  0.28),     # cheap, 1M ctx
+    "minimax/minimax-m3":           (0.30,   1.20),     # 1M ctx, multimodal
+    "z-ai/glm-5.2":                 (0.93,   3.00),     # premium Chinese model
+    "anthropic/claude-sonnet-4.6":  (3.00,  15.00),     # frontier coding
+    "anthropic/claude-sonnet-5":    (2.00,  10.00),     # frontier coding (cheaper than 4.6!)
+
+    # Paid direct
+    "Qwen/Qwen3.5-9B":              (0.18,   0.18),     # together paid tier
+    "devstral-small-2:24b":         (0.15,   0.60),     # llm7 paid tier
+
+    # Paid via Nous sub
+    "deepseek/deepseek-v4-flash":   (0.098,  0.196),    # nous_portal, same as OR
+
+    # Local
+    "qwen3.5:9b-16k":               (0.0,    0.0),      # ollama local
+    }
+
+def _estimate_cost(prompt_tokens: int, completion_tokens: int, model: str) -> float:
+    """Estimate USD cost for a request. Matches full model ID first, then falls
+    back to longest-prefix match for generic entries like 'gpt-4o'. Returns 0
+    for unknown/free models."""
+    if not prompt_tokens and not completion_tokens:
+        return 0.0
+    # Exact match first
+    cost = KNOWN_MODEL_COSTS.get(model)
+    if cost:
+        inp, out = cost
+        return (prompt_tokens / 1_000_000 * inp) + (completion_tokens / 1_000_000 * out)
+    # Longest-prefix substring match for generic entries
+    for key, (inp, out) in sorted(KNOWN_MODEL_COSTS.items(), key=lambda x: -len(x[0])):
+        if key in model:
+            return (prompt_tokens / 1_000_000 * inp) + (completion_tokens / 1_000_000 * out)
+    return 0.0
+
+# ── Bulkheads ───────────────────────────────────────────────────────────────
+# Max concurrent in-flight requests per provider. Prevents one slow provider
+# from consuming all worker threads. 0 = unlimited (default 4).
+BULKHEAD_MAX = int(os.environ.get("BULKHEAD_MAX_CONCURRENT", 4))
+
+# ── Trace IDs ────────────────────────────────────────────────────────────────
+# Every request gets a unique trace_id logged and returned as X-Trace-Id header.
+TRACE_ENABLED: bool = True
 
 
 def _load_auth_json() -> dict[str, list[str]]:
@@ -136,6 +227,94 @@ def _load_auth_json() -> dict[str, list[str]]:
 
 _AUTH_KEYS = _load_auth_json()
 
+# ── Bitwarden Secrets Manager integration ──────────────────────────────────
+# When BWS_ACCESS_TOKEN is available, cascade fetches API keys from Bitwarden
+# at module startup, falling back gracefully if the CLI or token is missing.
+
+_BW_KEYS: dict[str, str] = {}  # env_var_name -> value
+
+
+def _load_bitwarden_keys() -> dict[str, str]:
+    """Fetch ALL secrets from Bitwarden Secrets Manager via the `bws` CLI.
+
+    Requires BWS_ACCESS_TOKEN in the environment (loaded from cascade .env
+    by _load_env() at line 36, which runs before this function).
+
+    Returns {env_var_name: value} on success, {} on any failure (CLI not found,
+    token missing, network error, JSON parse error, non-zero exit).
+
+    The result is a flat key-value map — each Bitwarden secret's `key` field
+    IS the env var name (e.g. ``OPENAI_API_KEY``), and `value` is the key.
+    """
+    BWS_ENV = os.environ.get("BWS_ACCESS_TOKEN", "").strip()
+    if not BWS_ENV:
+        log.info("BWS_ACCESS_TOKEN not set — skipping Bitwarden key loading")
+        return {}
+
+    bws_path = shutil.which("bws")
+    if not bws_path:
+        # bws may not be in PATH when launched from a scheduled task.
+        # Check the Hermes bin directory directly.
+        hermes_bin = os.path.expanduser(
+            "~/AppData/Local/hermes/bin/bws"
+        )
+        if os.path.isfile(hermes_bin):
+            bws_path = hermes_bin
+    if not bws_path:
+        log.warning("bws CLI not found — skipping Bitwarden key loading")
+        return {}
+
+    try:
+        result = subprocess.run(
+            [bws_path, "secret", "list"],
+            capture_output=True, text=True, timeout=10,
+            env={**os.environ, "BWS_ACCESS_TOKEN": BWS_ENV},
+        )
+        if result.returncode != 0:
+            log.warning(
+                f"bws secret list exited {result.returncode}: "
+                f"{result.stderr.strip()}"
+            )
+            return {}
+
+        secrets = json.loads(result.stdout)
+        if not isinstance(secrets, list):
+            return {}
+
+        out: dict[str, str] = {}
+        for entry in secrets:
+            key = (entry.get("key") or "").strip()
+            value = (entry.get("value") or "").strip()
+            if key and value:
+                out[key] = value
+        log.info(f"Loaded {len(out)} API keys from Bitwarden")
+        return out
+    except FileNotFoundError:
+        log.warning("bws CLI not found — skipping Bitwarden key loading")
+        return {}
+    except subprocess.TimeoutExpired:
+        log.warning("bws secret list timed out after 10s — skipping Bitwarden")
+        return {}
+    except json.JSONDecodeError as e:
+        log.warning(f"bws output was not valid JSON: {e}")
+        return {}
+    except Exception as e:
+        log.warning(f"Failed to load keys from Bitwarden: {e}")
+        return {}
+
+
+_BW_KEYS = _load_bitwarden_keys()
+
+
+# ── Bitwarden env var name aliases ─────────────────────────────────────────────
+# Maps cascade's internal env var names to the actual Bitwarden key names.
+# Needed when the key was stored in Bitwarden under a different name than
+# what cascade's _keys_for() looks up.
+_BW_ENV_ALIASES: dict[str, str] = {
+    "NVIDIA_NIM_API_KEY":    "NVIDIA_API_KEY",       # BW has NVIDIA_API_KEY
+    "SAMBANOVA_DIRECT_API_KEY": "SAMBANOVA_API_KEY", # BW has SAMBANOVA_API_KEY
+    "GLM_API_KEYS":          "ZAI_API_KEY",          # BW has ZAI_API_KEY
+}
 # Circuit-breaker knobs — a provider that fails health repeatedly is tripped out
 # of rotation for a cooldown, then probed again (half-open). Overridable via env.
 BREAKER_WINDOW      = int(os.environ.get("BREAKER_WINDOW", 8))          # recent outcomes to weigh
@@ -144,7 +323,10 @@ BREAKER_ERROR_RATE  = float(os.environ.get("BREAKER_ERROR_RATE", 0.5))  # trip a
 BREAKER_COOLDOWN    = int(os.environ.get("BREAKER_COOLDOWN", 60))       # seconds the breaker stays open
 
 # Providers known for low-latency inference — promoted for short requests
-_FAST_PROVIDERS = {"groq", "cerebras", "sambanova", "mistral"}
+_FAST_PROVIDERS = {"groq", "zai", "github_models", "gemini",
+                     "sambanova_direct", "nvidia_nim", "naga",
+                     "openai", "nous_portal", "deepseek-v4-flash",
+                     "ovhcloud", "aion", "deepinfra", "together"}
 
 # Per-request counter for round-robin among equally-rated providers.
 # itertools.count().__next__ is atomic in CPython, so it's thread-safe.
@@ -155,47 +337,69 @@ _rr_counter = itertools.count()
 # Recommended base model: set CASCADE_MODEL_PROVIDER + CASCADE_MODEL_ID
 # e.g. CASCADE_MODEL_PROVIDER=openai  CASCADE_MODEL_ID=gpt-4o-mini
 KNOWN_MODEL_RATINGS: dict = {
-    # 1 — Outstanding
-    "gpt-5.3-codex": 1, "gpt-5-codex": 1, "gpt-4o": 1, "o1": 1, "o3": 1,
-    "claude-opus-4": 1, "claude-opus": 1, "gemini-2.5-pro": 1,
-    "nemotron-3-ultra": 1,
-    "gpt-4.5": 1, "claude-3-7": 1, "gemini-2.0-ultra": 1,
-    "deepseek-r2": 1, "qwen3-235b": 1, "qwen3-72b": 1,
-    "hermes-4-405b": 1,
-    # 2 — Best
-    "gemini-2.5-flash": 2, "gemini-2.0-flash": 2,
-    "llama-3.3-70b": 2, "llama-3.1-70b": 2,
-    "mistral-large": 2, "mistral-medium": 2,
-    "command-r-plus": 2, "command-a": 2, "nvidia/nemotron-3-super": 2, "nemotron": 2,
-    "deepseek-v4-flash": 2, "deepseek-v4": 2,  # capable but slow cold-start → "best", not first-choice
+    # 1 — Outstanding (frontier reasoning, coding, science)
+    "gpt-5": 1, "gpt-5-codex": 1, "gpt-4o": 1, "o1": 1, "o3": 1, "o4-mini": 1,
+    "claude-opus-5": 1, "claude-opus-4": 1, "claude-sonnet-5": 1, "claude-sonnet-4.6": 1,
+    "deepseek-v4-pro": 1, "deepseek-r2": 1,
+    "gemini-2.5-pro": 1, "gemini-2.5-flash-thinking": 1,
+    "nemotron-3-ultra": 1, "qwen3-235b": 1, "qwen3-72b": 1,
+
+    # 2 — Excellent (strong daily drivers, capable of complex tasks)
+    "deepseek-v4-flash": 2, "deepseek-v4": 2,
     "deepseek-v3": 2, "deepseek-v2": 2,
-    "claude-sonnet": 2, "claude-3-5": 2, "grok-2": 2,
-    "qwen2.5-72b": 2, "qwen-72b": 2, "qwen3-32b": 2,
-    "phi-4": 2, "phi-4-reasoning": 2,
-    "mixtral-8x22b": 2, "wizardlm-2-8x22b": 2,
-    "yi-large": 2, "moonshot-v1": 2,
-    "llama-4-maverick": 2, "llama-4-scout": 2,
-    "hermes-4-70b": 2,
-    # 3 — Good
+    "gemini-2.5-flash": 2,
+    "llama-3.3-70b": 2, "llama-3.1-70b": 2, "llama-4-maverick": 2, "llama-4-scout": 2,
+    "claude-3-5": 2, "claude-haiku": 2,
+    "mistral-large": 2, "command-a": 2,
+    "nvidia/nemotron-3-super": 2, "nemotron": 2,
+    "grok-2": 2, "grok-3": 2,
+    "qwen2.5-72b": 2, "qwen3-32b": 2,
+    "hy3-preview": 2, "phi-4-reasoning": 2,
+    "hermes-4-405b": 2, "hermes-4-70b": 2,
+    "glm-5.2": 2,
+
+    # 3 — Good (competent, fast, good for most tasks)
     "gemini-2.5-flash-lite": 3, "gemini-1.5-flash": 3,
     "gpt-4o-mini": 3, "gpt-oss-120b": 3,
-    "mistral-small": 3, "glm-4.5-flash": 3, "glm-4.7-flash": 3,
-    "llama-3.1-8b-instant": 3,
+    "mistral-medium": 3, "mistral-small": 3,
+    "glm-4.5-flash": 3, "glm-4.7-flash": 3,
+    "llama-3.1-8b-instant": 3, "llama-3.2-3b": 3,
     "qwen2.5-32b": 3, "qwen3-14b": 3, "qwen3-8b": 3,
+    "qwen3.5-9b": 3,
+    "DeepSeek-V3.2": 3, "DeepSeek-V2.5": 3,
+    "qwen2p5-coder-32b": 3,
+    "minimax-m3": 3,
+    "xiaomi/mimo-v2.5": 3,
+    "devstral-small-2:24b": 3,
+    "LongCat-2.0": 3,
     "hermes-4.3-36b": 3, "hermes-4.3": 3,
-    "phi-3.5": 3, "phi-3-medium": 3,
-    "mixtral-8x7b": 3, "wizardlm-2-7b": 3,
-    "yi-medium": 3, "yi-6b": 3,
-    # 4 — Fair
-    "command-r7b": 4, "command-r7b-12-2024": 4,
-    "llama-3.2-3b": 4, "mistral-7b": 4,
-    "qwen2.5-7b": 4, "qwen3-4b": 4, "phi-3-mini": 4,
-    "phi-3.5-mini": 4, "yi-mini": 4,
+    "phi-4": 3,
+    "coding-glm-5.2-free": 3,
+    "yi-large": 3,
+    "command-r-plus": 3,
+
+    # 4 — Fair (acceptable for simple tasks, fast)
+    "gemini-1.5-flash-8b": 4,
+    "command-r7b": 4,
+    "mistral-7b": 4,
+    "qwen2.5-7b": 4, "qwen3-4b": 4,
+    "phi-3.5": 4, "phi-3-medium": 4,
+    "mixtral-8x7b": 4,
+    "llama-4-scout": 4,
+    "yi-medium": 4, "yi-6b": 4,
+    "tencent/hy3-preview": 4,
+
+    # 5 — Basic (trivial tasks, micro models)
+    "phi-3-mini": 5, "phi-3.5-mini": 5,
+    "yi-mini": 5,
+    "qwen3-4b": 5,
+    "llama-4-scout": 5,
 }
+
 _RATING_PATTERNS: list = [
-    (1, ["pro-exp", "ultra", "opus", "o3", "o1-pro", "405b", "671b", "r1-zero"]),
-    (2, ["70b", "large", "plus", "pro", "turbo", "super", "sonnet", "72b", "32b", "maverick", "scout", "phi-4", "wizardlm"]),
-    (3, ["flash", "small", "mini", "medium", "120b", "8b-instant", "glm-4", "14b", "22b", "mixtral", "qwen", "yi-m", "phi-3"]),
+    (1, ["pro-exp", "ultra", "opus", "o3", "o1-pro", "405b", "671b", "r1-zero", "sonnet-5", "sonnet-4", "v4-pro", "codex", "thinking"]),
+    (2, ["70b", "large", "plus", "pro", "turbo", "super", "sonnet", "72b", "32b", "maverick", "phi-4", "wizardlm", "grok", "deepseek-v4", "hy3"]),
+    (3, ["flash", "small", "mini", "medium", "120b", "8b-instant", "glm-4", "14b", "22b", "mixtral", "qwen", "yi-m", "phi-3", "v3.2", "v2.5", "mimo", "minimax", "devstral", "longcat", "coder"]),
     (4, ["7b", "8b", "lite", "fast", "r7b", "nano", "3b", "phi-3-mini", "phi-3.5-mini", "yi-mini", "4b"]),
     (5, ["micro", "tiny", "1b"]),
 ]
@@ -241,13 +445,34 @@ def _keys(env_var: str) -> list[str]:
 
 def _keys_for(provider_name: str, env_var: str) -> list[str]:
     """All keys for a provider: auth.json entries first (the primary store that
-    `cascade auth add` writes to), then any matching .env keys as a fallback. Deduped,
-    order preserved. A provider with keys in EITHER source is enabled."""
+    `cascade auth add` writes to), then Bitwarden (if available), then .env keys
+    as a final fallback. Deduped, order preserved.
+
+    Bitwarden key resolution tries, in order:
+    1. Exact match on the env_var name
+    2. Singular form (strip trailing S) — handles OPENAI_API_KEYS → OPENAI_API_KEY
+    3. Alias table for known name mismatches (e.g. GLM_API_KEYS → ZAI_API_KEY)
+    """
     merged = list(_AUTH_KEYS.get(provider_name, []))
+
+    # Bitwarden: resolve the env var name through multiple strategies
+    bw_val = _BW_KEYS.get(env_var, "")
+    if not bw_val:
+        # Try singular form (strip trailing S)
+        singular = env_var[:-1] if env_var.endswith("S") else None
+        if singular and singular != env_var:
+            bw_val = _BW_KEYS.get(singular, "")
+    if not bw_val:
+        # Try global alias table (maps cascade env_var names to BW key names)
+        aliased = _BW_ENV_ALIASES.get(env_var, "")
+        if aliased:
+            bw_val = _BW_KEYS.get(aliased, "")
+    if bw_val:
+        merged.append(bw_val)
     merged += _keys(env_var)
     seen, out = set(), []
     for k in merged:
-        if k and k not in seen:
+        if k and k not in seen and "«redacted" not in k:
             seen.add(k)
             out.append(k)
     return out
@@ -275,19 +500,19 @@ def _parse_retry_after(value, default: int = 60) -> int:
 
 def _build_providers() -> list[dict]:
     providers = []
+    openrouter_keys = _keys_for("openrouter", "OPENROUTER_API_KEYS")
 
     # ════════════════════════════════════════════════════════════
     # Tier 1 — Fast & Free (handles ~90%+ of requests)
     # ════════════════════════════════════════════════════════════
 
     # --- cohere (command-a-03-2025 via OpenRouter) ---
-    cohere_keys = _keys_for("cohere", "COHERE_API_KEYS")
-    if cohere_keys:
+    if openrouter_keys:
         providers.append({
             "name":     "cohere",
             "base_url": "https://openrouter.ai/api/v1",
             "model":    "cohere/command-a-03-2025",
-            "keys":     cohere_keys,
+            "keys":     openrouter_keys,
             "cost":     0,
             "headers":  {
                 "HTTP-Referer": os.environ.get("OPENROUTER_SITE_URL",
@@ -298,13 +523,12 @@ def _build_providers() -> list[dict]:
         })
 
     # --- cerebras (gpt-oss-120b via OpenRouter) ---
-    cerebras_keys = _keys_for("cerebras", "CEREBRAS_API_KEYS")
-    if cerebras_keys:
+    if openrouter_keys:
         providers.append({
             "name":     "cerebras",
             "base_url": "https://openrouter.ai/api/v1",
             "model":    "cerebras/gpt-oss-120b",
-            "keys":     cerebras_keys,
+            "keys":     openrouter_keys,
             "cost":     0,
             "headers":  {
                 "HTTP-Referer": os.environ.get("OPENROUTER_SITE_URL",
@@ -315,13 +539,12 @@ def _build_providers() -> list[dict]:
         })
 
     # --- nvidia (deepseek-ai/deepseek-v4-flash via OpenRouter) ---
-    nvidia_keys = _keys_for("nvidia", "NVIDIA_API_KEYS")
-    if nvidia_keys:
+    if openrouter_keys:
         providers.append({
             "name":     "nvidia",
             "base_url": "https://openrouter.ai/api/v1",
             "model":    "nvidia/deepseek-ai/deepseek-v4-flash",
-            "keys":     nvidia_keys,
+            "keys":     openrouter_keys,
             "cost":     0,
             "headers":  {
                 "HTTP-Referer": os.environ.get("OPENROUTER_SITE_URL",
@@ -331,18 +554,28 @@ def _build_providers() -> list[dict]:
             },
         })
 
+    # --- nvidia_nim (direct NVIDIA NIM API, free dev tier — 100+ models) ---
+    nvidia_nim_keys = _keys_for("nvidia", "NVIDIA_NIM_API_KEY")
+    if nvidia_nim_keys:
+        providers.append({
+            "name":     "nvidia_nim",
+            "base_url": "https://integrate.api.nvidia.com/v1",
+            "model":    os.environ.get("NVIDIA_NIM_MODEL", "nvidia/nemotron-3-super-120b-a12b"),
+            "keys":     nvidia_nim_keys,
+            "cost":     0,
+        })
+
     # ════════════════════════════════════════════════════════════
     # Tier 2 — Free Large Context (overflow when fast tiers can't)
     # ════════════════════════════════════════════════════════════
 
     # --- mistral (mistral-medium-latest via OpenRouter) ---
-    mistral_keys = _keys_for("mistral", "MISTRAL_API_KEYS")
-    if mistral_keys:
+    if openrouter_keys:
         providers.append({
             "name":     "mistral",
             "base_url": "https://openrouter.ai/api/v1",
             "model":    "mistral/mistral-medium-latest",
-            "keys":     mistral_keys,
+            "keys":     openrouter_keys,
             "cost":     0,
             "headers":  {
                 "HTTP-Referer": os.environ.get("OPENROUTER_SITE_URL",
@@ -353,13 +586,12 @@ def _build_providers() -> list[dict]:
         })
 
     # --- sambanova (DeepSeek-V3.2 via OpenRouter) ---
-    sambanova_keys = _keys_for("sambanova", "SAMBANOVA_API_KEYS")
-    if sambanova_keys:
+    if openrouter_keys:
         providers.append({
             "name":     "sambanova",
             "base_url": "https://openrouter.ai/api/v1",
             "model":    "sambanova/DeepSeek-V3.2",
-            "keys":     sambanova_keys,
+            "keys":     openrouter_keys,
             "cost":     0,
             "headers":  {
                 "HTTP-Referer": os.environ.get("OPENROUTER_SITE_URL",
@@ -367,6 +599,17 @@ def _build_providers() -> list[dict]:
                 "X-Title":      os.environ.get("OPENROUTER_APP_NAME",
                     "cascade"),
             },
+        })
+
+    # --- sambanova_direct (direct SambaNova API, free tier — 20 RPM, 200K TPD) ---
+    sambanova_direct_keys = _keys_for("sambanova", "SAMBANOVA_DIRECT_API_KEY")
+    if sambanova_direct_keys:
+        providers.append({
+            "name":     "sambanova_direct",
+            "base_url": "https://api.sambanova.ai/v1",
+            "model":    os.environ.get("SAMBANOVA_DIRECT_MODEL", "DeepSeek-V3.2"),
+            "keys":     sambanova_direct_keys,
+            "cost":     0,
         })
 
     # ════════════════════════════════════════════════════════════
@@ -380,7 +623,7 @@ def _build_providers() -> list[dict]:
             "base_url": "https://inference-api.nousresearch.com/v1",
             "model":    os.environ.get("NOUS_PORTAL_MODEL", "deepseek/deepseek-v4-flash"),
             "keys":     nous_portal_keys,
-            "cost":     2,
+            "cost":     1,
         })
 
     openai_keys = _keys_for("openai", "OPENAI_API_KEYS")
@@ -412,9 +655,9 @@ def _build_providers() -> list[dict]:
         providers.append({
             "name":     "ollama",
             "base_url": "http://localhost:11434/v1",
-            "model":    os.environ.get("OLLAMA_MODEL", "qwen3:8b"),
+            "model":    os.environ.get("OLLAMA_MODEL", "qwen3.5:9b-16k"),
             "keys":     ["local"],
-            "cost":     2,
+            "cost":     3,
         })
 
     # ════════════════════════════════════════════════════════════
@@ -640,6 +883,107 @@ def _build_providers() -> list[dict]:
             "base_url": "https://router.huggingface.co/v1",
             "model":    os.environ.get("HUGGINGFACE_MODEL", "openai/gpt-oss-120b:cheapest"),
             "keys":     huggingface_keys,
+            "cost":     0,
+        })
+
+    # --- deepinfra (free, Qwen2.5-72B-Instruct) ---
+    deepinfra_keys = _keys_for("deepinfra", "DEEPINFRA_API_KEYS")
+    if deepinfra_keys:
+        providers.append({
+            "name":     "deepinfra",
+            "base_url": "https://api.deepinfra.com/v1/openai",
+            "model":    os.environ.get("DEEPINFRA_MODEL", "Qwen/Qwen2.5-72B-Instruct"),
+            "keys":     deepinfra_keys,
+            "cost":     0,
+        })
+
+    # --- fireworks (free, Qwen2.5-Coder-32B-Instruct) ---
+    fireworks_keys = _keys_for("fireworks", "FIREWORKS_API_KEYS")
+    if fireworks_keys:
+        providers.append({
+            "name":     "fireworks",
+            "base_url": "https://api.fireworks.ai/inference/v1",
+            "model":    os.environ.get("FIREWORKS_MODEL", "accounts/fireworks/models/qwen2p5-coder-32b-instruct"),
+            "keys":     fireworks_keys,
+            "cost":     0,
+        })
+
+    # ── Together AI (paid — free tier discontinued, Qwen3.5-9B ~$0.02/M) ──
+    together_keys = _keys_for("together", "TOGETHER_API_KEY")
+    if together_keys:
+        providers.append({
+            "name":     "together",
+            "base_url": "https://api.together.xyz/v1",
+            "model":    os.environ.get("TOGETHER_MODEL", "Qwen/Qwen3.5-9B"),
+            "keys":     together_keys,
+            "cost":     1,
+        })
+
+    # ── LLM7.io (paid — free tier discontinued; devstral-small-2:24b ~lowest cost) ──
+    llm7_keys = _keys_for("llm7", "LLM7_API_KEY")
+    if llm7_keys:
+        providers.append({
+            "name":     "llm7",
+            "base_url": "https://api.llm7.io/v1",
+            "model":    os.environ.get("LLM7_MODEL", "devstral-small-2:24b"),
+            "keys":     llm7_keys,
+            "cost":     1,
+        })
+
+    # ── OVHcloud AI Endpoints (free anonymous tier, no signup, no key) ─────
+    # 2 RPM per IP per model on anonymous tier. No key, no registration needed.
+    # Models: Qwen3.5-397B-A17B, gpt-oss-120b, Qwen3.6-27B, DeepSeek-R1, etc.
+    # Sign up for a Public Cloud project for $200 free credits + 400 RPM.
+    ovh_keys = _keys_for("ovhcloud", "OVH_API_KEY")  # leave unset for anonymous tier
+    providers.append({
+        "name":     "ovhcloud",
+        "base_url": "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1",
+        "model":    os.environ.get("OVHCLOUD_MODEL", "gpt-oss-120b"),
+        "keys":     ovh_keys or [""],
+        "cost":     0,
+    })
+
+    # ── Aion Labs (permanent free, no credit card — 15 RPM, 20K TPD) ───
+    aion_keys = _keys_for("aion", "AION_API_KEY")
+    if aion_keys:
+        providers.append({
+            "name":     "aion",
+            "base_url": "https://api.aionlabs.ai/v1",
+            "model":    os.environ.get("AION_MODEL", "gpt-4o-mini"),
+            "keys":     aion_keys,
+            "cost":     0,
+        })
+
+    # ── LongCat (permanent free tier — 55M tokens/day) ──────────────────
+    longcat_keys = _keys_for("longcat", "LONGCAT_API_KEY")
+    if longcat_keys:
+        providers.append({
+            "name":     "longcat",
+            "base_url": "https://api.longcat.chat/openai/v1",
+            "model":    os.environ.get("LONGCAT_MODEL", "LongCat-2.0"),
+            "keys":     longcat_keys,
+            "cost":     0,
+        })
+
+    # ── SiliconFlow (free — DeepSeek-V2.5, 30 RPM, 60K TPM) ────────────────────
+    siliconflow_keys = _keys_for("siliconflow", "SILICONFLOW_API_KEY")
+    if siliconflow_keys:
+        providers.append({
+            "name":     "siliconflow",
+            "base_url": "https://api.siliconflow.cn/v1",
+            "model":    os.environ.get("SILICONFLOW_MODEL", "deepseek-ai/DeepSeek-V2.5"),
+            "keys":     siliconflow_keys,
+            "cost":     0,
+        })
+
+    # ── AI Hub Mix (free tier — 2 RPM, 100K context) ─────────────────────
+    aihubmix_keys = _keys_for("aihubmix", "AIHUBMIX_API_KEY")
+    if aihubmix_keys:
+        providers.append({
+            "name":     "aihubmix",
+            "base_url": "https://api.aihubmix.com/v1",
+            "model":    os.environ.get("AIHUBMIX_MODEL", "coding-glm-5.2-free"),
+            "keys":     aihubmix_keys,
             "cost":     0,
         })
 
@@ -897,10 +1241,25 @@ def _get_smart_ordered(providers: list, complexity: int, est_tokens: int = 0) ->
         avail  = state.get("available", True)
         fast   = 0 if (fast_first and p["name"] in _FAST_PROVIDERS) else 1
         cost   = p.get("cost", 0)
+        lat    = state.get("latency_ms", 99999)
+
+        # Reasoning support: for complex tasks (complexity 1-2), prefer
+        # providers whose model actually supports chain-of-thought thinking.
+        # Gets model with better quality answers for hard problems.
+        needs_reasoning = 1 if complexity <= 2 else 0
+        reasoning_boost = 0 if (needs_reasoning and state.get("reasoning")) else 1
+
+        # Actual per-1M-token cost from KNOWN_MODEL_COSTS — within the same
+        # cost tier, cheaper providers should be tried first so we don't waste
+        # money on expensive models when a cheaper one is just as good.
+        model_name = state.get("model", p.get("model", ""))
+        _cost_pair = KNOWN_MODEL_COSTS.get(model_name, (0.0, 0.0))
+        token_cost = _cost_pair[0] + _cost_pair[1]  # input + output per 1M
+
         # Health-aware terms — tier/sort_within stay FIRST so capability matching
         # is never overridden by health (a healthy weak model must not outrank the
         # correct-capability one). When every candidate is healthy these two terms
-        # are constant (0), leaving the existing round-robin/tie order untouched.
+        # are constant (0), leaving the existing tie order untouched.
         breaker_open = 1 if stats.breaker_open(p["name"]) else 0  # open breakers sink within tier
         health       = stats.health_bucket(p["name"])            # 0 healthy / 1 degraded / 2 bad
         if rating <= complexity:
@@ -909,7 +1268,13 @@ def _get_smart_ordered(providers: list, complexity: int, est_tokens: int = 0) ->
         else:
             tier        = 1
             sort_within = rating - complexity   # too weak — closest first
-        return (cost, tier, sort_within, breaker_open, health, 0 if avail else 1, fast)
+        return (cost, tier, sort_within,
+                breaker_open, health,
+                reasoning_boost,          # 0 = reasoning-capable AND complex task (promoted)
+                0 if avail else 1,         # available first
+                lat,                       # faster first
+                token_cost,                # cheaper per-token first
+                fast)
 
     n = len(providers)
     offset = next(_rr_counter) % n if n else 0
@@ -1027,6 +1392,45 @@ class CredentialPool:
 
 pool = CredentialPool(PROVIDERS)
 
+# ── Bulkhead manager ────────────────────────────────────────────────────────────
+class BulkheadManager:
+    """Per-provider concurrency limiter. Prevents a single slow provider from
+    consuming all worker threads. Uses a lock-protected counter (not Semaphore)
+    so we can inspect active counts for observability."""
+    def __init__(self, providers: list[dict], max_concurrent: int = 4):
+        self.max = max_concurrent
+        self.lock = threading.Lock()
+        self._active: dict[str, int] = {}
+        for p in providers:
+            self._active[p["name"]] = 0
+
+    def try_acquire(self, provider_name: str) -> bool:
+        """Try to start a request. Returns True if under limit, False if capped."""
+        if self.max <= 0:
+            return True
+        with self.lock:
+            c = self._active.get(provider_name, 0)
+            if c >= self.max:
+                return False
+            self._active[provider_name] = c + 1
+            return True
+
+    def release(self, provider_name: str):
+        if self.max <= 0:
+            return
+        with self.lock:
+            c = self._active.get(provider_name, 0)
+            if c > 0:
+                self._active[provider_name] = c - 1
+
+    def status(self) -> dict[str, dict]:
+        with self.lock:
+            return {n: {"max": self.max if self.max > 0 else 0,
+                         "active": c}
+                    for n, c in self._active.items()}
+
+bulkhead = BulkheadManager(PROVIDERS, BULKHEAD_MAX)
+
 # Background: validate providers, fix models, assign ratings
 threading.Thread(target=_initialize_ratings, args=(PROVIDERS, pool), daemon=True).start()
 
@@ -1043,7 +1447,9 @@ class ProviderStats:
         if name not in self._data:
             self._data[name] = {"latency_sum": 0.0, "latency_count": 0,
                                 "error_count": 0, "request_count": 0,
-                                "health": deque(maxlen=BREAKER_WINDOW), "open_until": 0.0}
+                                "health": deque(maxlen=BREAKER_WINDOW), "open_until": 0.0,
+                                "cost_total": 0.0, "prompt_tokens": 0, "completion_tokens": 0,
+                                "trace_ids": deque(maxlen=100)}
 
     def record_success(self, name: str, latency_s: float):
         with self.lock:
@@ -1059,6 +1465,19 @@ class ProviderStats:
             s = self._data[name]
             s["error_count"]   += 1
             s["request_count"] += 1
+
+    def record_cost(self, name: str, cost_usd: float, prompt_tok: int, completion_tok: int):
+        with self.lock:
+            self._ensure(name)
+            s = self._data[name]
+            s["cost_total"] += cost_usd
+            s["prompt_tokens"] += prompt_tok
+            s["completion_tokens"] += completion_tok
+
+    def record_trace(self, name: str, trace_id: str):
+        with self.lock:
+            self._ensure(name)
+            self._data[name]["trace_ids"].append(trace_id)
 
     # ── Circuit breaker ──────────────────────────────────────────────────────
     def record_health(self, name: str, ok: bool):
@@ -1119,6 +1538,9 @@ class ProviderStats:
                 "error_rate":     round(ec / rc, 3) if rc else 0.0,
                 "total_requests": rc,
                 "errors":         ec,
+                "cost_total_usd": round(s.get("cost_total", 0.0), 6),
+                "prompt_tokens":  s.get("prompt_tokens", 0),
+                "completion_tokens": s.get("completion_tokens", 0),
             }
 
     def all_summaries(self) -> dict:
@@ -1734,17 +2156,31 @@ def forward(provider: dict, key: str, payload: dict, streaming: bool) -> request
             log.error(f"  Network error → anthropic: {e}")
             return None
 
+    # Sanitize header values — HTTP headers must be latin-1 encodable.
+    # Some corrupted keys (e.g. placeholder redaction text) contain
+    # non-latin-1 characters (U+2026 …). Replace silently rather than
+    # crashing with UnicodeEncodeError.
+    def _sanitize_header(v: str) -> str:
+        try:
+            v.encode("latin-1")
+            return v
+        except UnicodeEncodeError:
+            safe = v.encode("latin-1", errors="replace").decode("latin-1")
+            log.warning("  sanitized non-latin-1 chars in header value")
+            return safe
+
     headers = {
-        "Authorization": f"Bearer {key}",
+        "Authorization": f"Bearer {_sanitize_header(key)}",
         "Content-Type":  "application/json",
         **provider.get("headers", {}),
     }
 
     body = dict(payload)
 
-    # Remap any placeholder model name to the provider's real model
-    if body.get("model", "") in ("", CASCADE_MODEL, "auto", "any"):
-        body["model"] = provider["model"]
+    # Remap model name to the provider's real model. The model the client
+    # sends is a cascade-level abstraction — always substitute to the
+    # provider's actual model before forwarding.
+    body["model"] = provider["model"]
 
     # Strip thinking fields from conversation history before forwarding
     if "messages" in body:
@@ -1871,13 +2307,14 @@ def _route_completion(payload: dict, streaming: bool):
         ("error",  error_dict, status)   every provider exhausted
     """
     messages = payload.get("messages", [])
+    trace_id = _uuid.uuid4().hex[:12]
 
     # Cache check (non-streaming only)
     if not streaming:
         cached = cache.get(payload)
         if cached is not None:
-            log.info("↩ cache hit")
-            return ("json", cached)
+            log.info("[%s] ↩ cache hit", trace_id)
+            return ("json", cached, trace_id)
 
     est_tokens = _estimated_tokens(messages)
 
@@ -1905,8 +2342,8 @@ def _route_completion(payload: dict, streaming: bool):
             _adaptive_mt = 4096
 
     if _adaptive_mt and (_client_mt <= 0 or _adaptive_mt < _client_mt):
-        log.info("→ adaptive max_tokens: %d (client had %d, ~%d input tok)",
-                 _adaptive_mt, _client_mt, est_tokens)
+        log.info("[%s] → adaptive max_tokens: %d (client had %d, ~%d input tok)",
+                 trace_id, _adaptive_mt, _client_mt, est_tokens)
         payload = dict(payload)
         payload["max_tokens"] = _adaptive_mt
 
@@ -1915,11 +2352,28 @@ def _route_completion(payload: dict, streaming: bool):
     # cascade uses only providers that serve that model.
     _prompt_model = _pick_model_by_prompt(messages)
     if _prompt_model:
-        log.info("→ prompt-route matched model=%s", _prompt_model)
+        log.info("[%s] → prompt-route matched model=%s", trace_id, _prompt_model)
         payload = dict(payload)
         payload["model"] = _prompt_model
 
     ordered    = _ordered_providers(payload)
+
+    # Filter providers whose startup probe returned unavailable (e.g. auth
+    # failures, model-id mismatches). This avoids wasting a round-trip on
+    # providers that are known to fail. SAFETY: if filtering would leave zero
+    # providers, fall through to all of them (half-open probe).
+    avail = [p for p in ordered
+             if _provider_state.get(p["name"], {}).get("available", True)]
+    if len(avail) < len(ordered):
+        if avail:
+            log.info("[%s] → filtered %d unavailable provider(s): %s",
+                     trace_id, len(ordered) - len(avail),
+                     [p["name"] for p in ordered if p not in avail])
+            ordered = avail
+        else:
+            log.info("[%s] → all providers unavailable — probing all (half-open)", trace_id)
+
+    log.info("[%s] → ordered=%s", trace_id, [p["name"] for p in ordered])
 
     # Tool-aware routing: when the request carries tools, prefer providers whose
     # model actually supports function calling — otherwise a provider that
@@ -1939,97 +2393,115 @@ def _route_completion(payload: dict, streaming: bool):
 
         # Breaker open → skip (unless all are open, then probe everything).
         if any_closed and stats.breaker_open(name):
-            log.info(f"⨂ skipping {name} (circuit open)")
+            log.info("[%s] ⨂ skipping %s (circuit open)", trace_id, name)
             continue
 
         # Tool request → skip providers whose model can't do function calling.
         if enforce_tool and not _supports_tools(provider):
-            log.info(f"⚒ skipping {name} (no tool support)")
+            log.info("[%s] ⚒ skipping %s (no tool support)", trace_id, name)
             continue
 
         # Skip providers whose payload ceiling this request would exceed
         # (e.g. Groq's free TPM) — avoids a guaranteed 413 round-trip.
         cap = provider.get("skip_if_tokens_over", 0)
         if cap and est_tokens > cap:
-            log.info(f"⤳ skipping {name} (~{est_tokens} tok > {cap} cap)")
+            log.info("[%s] ⤳ skipping %s (~%d tok > %d cap)", trace_id, name, est_tokens, cap)
+            continue
+
+        # Bulkhead: limit concurrent in-flight requests per provider.
+        if not bulkhead.try_acquire(name):
+            log.info("[%s] ⏸ bulkhead full for %s", trace_id, name)
             continue
 
         attempts = len(pool.pools.get(name, [])) or 1
 
-        for _ in range(attempts):
-            key = pool.get_key(name)
-            if not key:
-                log.warning(f"All {name} keys cooling — skipping provider")
-                break
+        try:
+            for _ in range(attempts):
+                key = pool.get_key(name)
+                if not key:
+                    log.warning("[%s] All %s keys cooling — skipping provider", trace_id, name)
+                    break
 
-            log.info(f"→ Trying {name} ...{key[-6:]}")
-            t0   = time.time()
-            resp, was_clamped = forward(provider, key, payload, streaming)
-            elapsed = time.time() - t0
+                log.info("[%s] → Trying %s ...%s", trace_id, name, key[-6:])
+                t0   = time.time()
+                resp, was_clamped = forward(provider, key, payload, streaming)
+                elapsed = time.time() - t0
 
-            if resp is None:
-                stats.record_error(name)
-                stats.record_health(name, False)   # network/timeout = provider health failure
-                pool.mark_rate_limited(name, key, retry_after=30)
-                continue
+                if resp is None:
+                    stats.record_error(name)
+                    stats.record_health(name, False)   # network/timeout = provider health failure
+                    pool.mark_rate_limited(name, key, retry_after=30)
+                    continue
 
-            if resp.status_code == 429:
-                stats.record_error(name)
-                # 429 is NOT a health failure — key cooldown already handles it.
-                retry_after = _parse_retry_after(resp.headers.get("Retry-After"))
-                pool.mark_rate_limited(name, key, retry_after=retry_after)
-                log.warning(f"  {name} 429 — cooldown {retry_after}s, trying next key")
-                continue
+                if resp.status_code == 429:
+                    stats.record_error(name)
+                    # 429 is NOT a health failure — key cooldown already handles it.
+                    retry_after = _parse_retry_after(resp.headers.get("Retry-After"))
+                    pool.mark_rate_limited(name, key, retry_after=retry_after)
+                    log.warning("[%s]   %s 429 — cooldown %ds, trying next key", trace_id, name, retry_after)
+                    continue
 
-            if resp.status_code in (400, 401, 403):
-                stats.record_error(name)
-                # request/auth-specific — NOT a provider health failure.
-                log.error(f"  {name} {resp.status_code} — skipping provider: {resp.text[:200]}")
-                break
+                if resp.status_code in (400, 401, 403):
+                    stats.record_error(name)
+                    # request/auth-specific — NOT a provider health failure.
+                    log.error("[%s]   %s %d — skipping provider: %s",
+                              trace_id, name, resp.status_code, resp.text[:200])
+                    break
 
-            if resp.status_code == 413:
-                stats.record_error(name)
-                # payload-specific — NOT a provider health failure.
-                log.warning(f"  {name} 413 — payload too large, cascading")
-                break
+                if resp.status_code == 413:
+                    stats.record_error(name)
+                    # payload-specific — NOT a provider health failure.
+                    log.warning("[%s]   %s 413 — payload too large, cascading", trace_id, name)
+                    break
 
-            if resp.status_code >= 500:
-                stats.record_error(name)
-                stats.record_health(name, False)   # 5xx = provider health failure
-                pool.mark_rate_limited(name, key, retry_after=15)
-                continue
+                if resp.status_code >= 500:
+                    stats.record_error(name)
+                    stats.record_health(name, False)   # 5xx = provider health failure
+                    pool.mark_rate_limited(name, key, retry_after=15)
+                    continue
 
-            if not (200 <= resp.status_code < 300):
-                stats.record_error(name)
-                stats.record_health(name, False)   # unexpected non-2xx = health failure
-                log.warning(f"  {name} unexpected {resp.status_code} — skipping provider")
-                break
+                if not (200 <= resp.status_code < 300):
+                    stats.record_error(name)
+                    stats.record_health(name, False)   # unexpected non-2xx = health failure
+                    log.warning("[%s]   %s unexpected %d — skipping provider", trace_id, name, resp.status_code)
+                    break
 
-            # Success
-            stats.record_success(name, elapsed)
-            stats.record_health(name, True)        # 2xx = healthy (half-open recovery)
-            log.info(f"  ✓ {name} {resp.status_code} ({elapsed*1000:.0f}ms)")
+                # Success
+                stats.record_success(name, elapsed)
+                stats.record_health(name, True)        # 2xx = healthy (half-open recovery)
+                stats.record_trace(name, trace_id)
+                log.info("[%s]   ✓ %s %d (%.0fms)", trace_id, name, resp.status_code, elapsed * 1000)
 
-            # Output was clamped (e.g. Cohere 8K cap) — don't return truncated
-            # result. Cascade to next provider which may handle full length.
-            if was_clamped:
-                log.info(f"  ↻ clamped output — cascading to next provider for full response")
-                break
+                # Output was clamped (e.g. Cohere 8K cap) — don't return truncated
+                # result. Cascade to next provider which may handle full length.
+                if was_clamped:
+                    log.info("[%s]   ↻ clamped output — cascading to next provider for full response", trace_id)
+                    break
 
-            is_anthropic = provider.get("protocol") == "anthropic"
-            if streaming:
-                gen = (_anthropic_streaming_generator(resp) if is_anthropic
-                       else _streaming_generator(resp))
-                return ("stream", gen, name)
-            else:
-                data = (_from_anthropic_response(_replace_surrogates(resp.json())) if is_anthropic
-                        else _replace_surrogates(resp.json()))
-                if not is_anthropic:
-                    _strip_response(data)
-                cache.set(payload, data)
-                return ("json", data)
+                is_anthropic = provider.get("protocol") == "anthropic"
+                if streaming:
+                    gen = (_anthropic_streaming_generator(resp) if is_anthropic
+                           else _streaming_generator(resp))
+                    return ("stream", gen, name, trace_id)
+                else:
+                    data = (_from_anthropic_response(_replace_surrogates(resp.json())) if is_anthropic
+                            else _replace_surrogates(resp.json()))
+                    if not is_anthropic:
+                        _strip_response(data)
+                    # --- Cost tracking ---
+                    usage = data.get("usage", {})
+                    prompt_tok = usage.get("prompt_tokens", 0) or usage.get("input_tokens", 0)
+                    completion_tok = usage.get("completion_tokens", 0) or usage.get("output_tokens", 0)
+                    cost = _estimate_cost(prompt_tok, completion_tok, provider.get("model", ""))
+                    if cost > 0:
+                        log.info("[%s]   $ cost=%.6f (%d+%d tok)", trace_id, cost, prompt_tok, completion_tok)
+                        stats.record_cost(name, cost, prompt_tok, completion_tok)
+                    cache.set(payload, data)
+                    return ("json", data, trace_id)
 
-        log.info(f"→ {name} done — trying next provider")
+            log.info("[%s] → %s done — trying next provider", trace_id, name)
+        finally:
+            bulkhead.release(name)
 
     return ("error", {"error": {"message": "All providers exhausted", "type": "router_error"}}, 503)
 
@@ -2047,11 +2519,12 @@ def chat():
 
     result = _route_completion(payload, payload.get("stream", False))
     if result[0] == "json":
-        return jsonify(result[1]), 200
+        _, data, trace_id = result
+        return jsonify(data), 200, {"X-Trace-Id": trace_id}
     if result[0] == "stream":
-        _, gen, name = result
+        _, gen, name, trace_id = result
         return Response(stream_with_context(gen), content_type="text/event-stream",
-                        headers={"X-Provider": name})
+                        headers={"X-Provider": name, "X-Trace-Id": trace_id})
     return jsonify(result[1]), result[2]
 
 
@@ -2073,11 +2546,13 @@ def anthropic_messages():
     result    = _route_completion(payload, streaming)
 
     if result[0] == "json":
-        return jsonify(_openai_response_to_anthropic(result[1])), 200
+        _, data, trace_id = result
+        return jsonify(_openai_response_to_anthropic(data)), 200, {"X-Trace-Id": trace_id}
     if result[0] == "stream":
-        _, gen, name = result
+        _, gen, name, trace_id = result
         return Response(stream_with_context(_openai_stream_to_anthropic(gen)),
-                        content_type="text/event-stream", headers={"X-Provider": name})
+                        content_type="text/event-stream",
+                        headers={"X-Provider": name, "X-Trace-Id": trace_id})
     return jsonify(_anthropic_error(result[1].get("error", {}).get("message", "error"))), result[2]
 
 
@@ -2228,6 +2703,19 @@ def status():
             "error_rate":  BREAKER_ERROR_RATE,
             "cooldown_s":  BREAKER_COOLDOWN,
         },
+        "bulkhead": {
+            "enabled":       BULKHEAD_MAX > 0,
+            "max_concurrent": BULKHEAD_MAX,
+            "per_provider":  bulkhead.status(),
+        },
+        "trace": {
+            "enabled":       TRACE_ENABLED,
+            "header":        "X-Trace-Id",
+        },
+        "cost_tracking": {
+            "enabled":       len(KNOWN_MODEL_COSTS) > 0,
+            "models_priced": len(KNOWN_MODEL_COSTS),
+        },
     })
 
 
@@ -2255,7 +2743,7 @@ def metrics():
     emit("cascade_providers", "gauge", "Number of configured providers",
          [({}, len(PROVIDERS))])
 
-    req, errs, lat, brk = [], [], [], []
+    req, errs, lat, brk, cost_m = [], [], [], [], []
     for p in PROVIDERS:
         name = p["name"]
         s = stats.summary(name)
@@ -2264,14 +2752,24 @@ def metrics():
         if s["avg_latency_ms"] is not None:
             lat.append(({"provider": name}, s["avg_latency_ms"]))
         brk.append(({"provider": name}, 1 if stats.breaker_open(name) else 0))
+        cost_m.append(({"provider": name}, s["cost_total_usd"]))
     emit("cascade_requests_total", "counter", "Total requests routed per provider", req)
     emit("cascade_errors_total", "counter", "Total errored requests per provider", errs)
     emit("cascade_avg_latency_ms", "gauge", "Mean successful-request latency in ms per provider", lat)
     emit("cascade_circuit_breaker_open", "gauge", "1 if the provider's circuit breaker is open, else 0", brk)
+    emit("cascade_cost_total_usd", "counter", "Total estimated USD cost per provider", cost_m)
 
     emit("cascade_cache_hits_total", "counter", "Response-cache hits", [({}, cache.hits)])
     emit("cascade_cache_misses_total", "counter", "Response-cache misses", [({}, cache.misses)])
     emit("cascade_cache_size", "gauge", "Entries currently in the response cache", [({}, cache.size)])
+
+    # Bulkhead metrics
+    bh = bulkhead.status()
+    emit("cascade_bulkhead_max", "gauge", "Per-provider bulkhead limit", [({}, BULKHEAD_MAX)])
+    for p_name, bd in bh.items():
+        if bd["active"] > 0:
+            emit("cascade_bulkhead_active", "gauge", "Active requests per provider",
+                 [({"provider": p_name}, bd["active"])])
 
     return Response("\n".join(out) + "\n", content_type="text/plain; version=0.0.4")
 
@@ -2283,6 +2781,8 @@ if __name__ == "__main__":
     log.info(f"Embeddings (/v1/embeddings): {_embed if _embed else 'no embed-capable providers'}")
     log.info(f"Cache: {'enabled' if CACHE_TTL > 0 else 'disabled'} (TTL={CACHE_TTL}s, max={CACHE_MAX_SIZE})")
     log.info(f"Fast routing: {'enabled' if FAST_ROUTE_TOKENS > 0 else 'disabled'} (threshold={FAST_ROUTE_TOKENS} tokens)")
+    log.info(f"Bulkhead: {'enabled' if BULKHEAD_MAX > 0 else 'disabled'} (max={BULKHEAD_MAX} concurrent/provider)")
+    log.info(f"Cost tracking: {len(KNOWN_MODEL_COSTS)} models priced")
     _skips = {p["name"]: p["skip_if_tokens_over"] for p in PROVIDERS if p.get("skip_if_tokens_over")}
     if _skips:
         log.info(f"Large-payload skip ceilings: {_skips}")
