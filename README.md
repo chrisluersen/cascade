@@ -1,31 +1,70 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="800" height="200" viewBox="0 0 800 200">
-  <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0%" stop-color="#0a0a1a"/>
-      <stop offset="100%" stop-color="#141428"/>
-    </linearGradient>
-    <linearGradient id="line" x1="0" y1="0" x2="1" y2="0">
-      <stop offset="0%" stop-color="#6366f1"/>
-      <stop offset="50%" stop-color="#a78bfa"/>
-      <stop offset="100%" stop-color="#818cf8"/>
-    </linearGradient>
-  </defs>
-  <rect width="800" height="200" fill="url(#bg)" rx="16"/>
-  <text x="60" y="85" font-family="system-ui, sans-serif" font-size="56" font-weight="700" fill="#e0e7ff">cascade</text>
-  <text x="60" y="125" font-family="system-ui, sans-serif" font-size="18" fill="#94a3b8">Intelligent AI request routing — failover across 15+ providers</text>
-  <rect x="60" y="145" width="680" height="3" rx="1.5" fill="url(#line)"/>
-  <text x="60" y="175" font-family="system-ui, monospace" font-size="13" fill="#64748b">OpenAI · Anthropic · Gemini · Groq · Mistral · Cohere · OpenRouter · and more</text>
-</svg>
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/cascade-cover.png">
+  <img alt="cascade — intelligent AI request routing" src="docs/assets/cascade-cover.png" width="100%">
+</picture>
 
-**cascade** is an intelligent AI inference router. It sits between your application and a pool of LLM providers — routing each request to the best provider based on capability, cost, real-time health, and prompt content. When one provider is rate-limited or down, it automatically fails over to the next.
+# cascade
+
+**Intelligent AI inference routing** — failover across 15+ LLM providers with automatic fallback, key rotation, circuit breakers, and provider-aware model selection.
+
+[![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.11+-brightgreen)](#)
+[![Providers](https://img.shields.io/badge/providers-15+_│_6_cost_tiers-8b5cf6)](#supported-providers)
+[![Dual SDK](https://img.shields.io/badge/SDK-OpenAI_∷_Anthropic-ff6b6b)](#quick-start)
+
+cascade sits between your application and every major LLM API — trying providers in cost order, falling through when they fail, and returning the first successful response. Free tiers get priority; paid providers are the safety net.
+
+```mermaid
+flowchart LR
+    App[Your App]
+    C[cascade ✦]
+    F[Free Providers<br/>Gemini · Groq · Cohere<br/>SambaNova · Mistral · ...]
+    P[Paid Providers<br/>OpenAI · Anthropic]
+    L[Local<br/>Ollama]
+    App --> C
+    C --> F --> P --> L
+    C -. "failover →" .-> P
+    C -. "failover →" .-> L
+    style C fill:#1e1b4b,stroke:#818cf8,color:#e0e7ff
+    style F fill:#0f172a,stroke:#22c55e,color:#bbf7d0
+    style P fill:#0f172a,stroke:#f59e0b,color:#fde68a
+    style L fill:#0f172a,stroke:#6366f1,color:#c7d2fe
+```
 
 ```
-  Your App ──────► cascade ──► Gemini → SambaNova → Groq → Mistral → (tries each until one works)
- (OpenAI SDK or    :8319        ↓
-  Anthropic SDK)               └──► Automatic failover, key rotation, circuit breakers
+⏺ Single endpoint → 15+ providers, cost-ordered, seamless failover
 ```
 
-**Why cascade, not a single provider?** Free tiers are generous but unreliable — rate limits, outages, model deprecations. cascade keeps you online by spreading across them, and only falls through to paid providers when every free option is exhausted.
+## Quick Start
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/chrisluersen/cascade/main/get.sh | bash
+cascade setup
+```
+
+Then use any OpenAI SDK:
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://localhost:8319/v1", api_key="sk-cascade-1")
+resp = client.chat.completions.create(model="cascade", messages=[{"role": "user", "content": "Hello!"}])
+```
+
+Or Anthropic SDK — same endpoint:
+
+```python
+import anthropic
+client = anthropic.Anthropic(api_key="sk-cascade-1", base_url="http://localhost:8319")
+msg = client.messages.create(model="claude-sonnet-5", max_tokens=100, messages=[{"role": "user", "content": "Hello!"}])
+```
+
+> **cascade speaks both SDKs natively.** Translate `/v1/messages` ↔ `/v1/chat/completions`, tool calls, and thinking fields transparently.
+
+## Why cascade?
+
+Free LLM tiers are generous but unreliable — rate limits, deprecations, and outages are the norm. cascade spreads your requests across them, tries the cheapest capable provider first, and only falls through to paid APIs when everything free is exhausted.
+
+**The result:** free-tier reliability without single-provider lock-in. One endpoint, no SDK changes, intelligent routing.
 
 ## Features
 
@@ -44,9 +83,9 @@
 | **Reasoning model support** | Extra token headroom for thinking models before they answer |
 | **Thinking field stripping** | Removes reasoning fields that break non-Claude providers |
 | **Embeddings routing** | Multi-provider with failover — Gemini, Mistral, OpenAI, Cohere |
-| **Model auto-discovery** | Probes /models endpoint, fixes stale or renamed models |
-| **Anthropic ↔ OpenAI translation** | Transparent /v1/messages ↔ /v1/chat/completions with tool mapping |
-| **Observability** | Prometheus /metrics, /v1/status dashboard, per-provider latency stats |
+| **Model auto-discovery** | Probes `/models` endpoint, fixes stale or renamed models |
+| **Anthropic ↔ OpenAI translation** | Transparent `/v1/messages` ↔ `/v1/chat/completions` with tool mapping |
+| **Observability** | Prometheus `/metrics`, `/v1/status` dashboard, per-provider latency stats |
 | **Key management** | `auth.json` credential store + `.env` fallback — CLI-managed |
 
 ## Architecture
@@ -89,37 +128,6 @@ A single Python file (~2300 lines) running Flask/Waitress. One request flows thr
 | **Paid** | OpenAI, Anthropic, DeepSeek (via OpenRouter), Nous Portal | per-token |
 | **Local** | Ollama (any local model) | $0 |
 
-## Quick Start
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/chrisluersen/cascade/main/get.sh | bash
-cascade setup
-```
-
-Then use any OpenAI SDK client:
-
-```python
-from openai import OpenAI
-
-client = OpenAI(base_url="http://localhost:8319/v1", api_key="sk-cascade-1")
-resp = client.chat.completions.create(
-    model="cascade",          # cascade picks the best provider automatically
-    messages=[{"role": "user", "content": "Hello!"}],
-)
-```
-
-Or Anthropic SDK — same endpoint:
-
-```python
-import anthropic
-client = anthropic.Anthropic(api_key="sk-cascade-1", base_url="http://localhost:8319")
-msg = client.messages.create(
-    model="claude-sonnet-5",  # model name is a hint — cascade may route elsewhere
-    max_tokens=100,
-    messages=[{"role": "user", "content": "Hello!"}],
-)
-```
-
 ## Commands
 
 | Command | Action |
@@ -145,7 +153,7 @@ msg = client.messages.create(
 - **[Providers](documentation/providers.md)** — sign-up links, capabilities, rate limits
 - **[Monitoring](documentation/monitoring.md)** — `cascade status`, Prometheus `/metrics`, `/v1/status`
 - **[Build an agent](documentation/build-an-agent.md)** — chatbot → memory → tools
-- **[Concepts](documentation/concepts.md)** — plain-language glossary of every term you'll encounter
+- **[Concepts](documentation/concepts.md)** — plain-language glossary
 - **[Routing spec](documentation/routing-spec.md)** — provider cascade, timeouts, model selection
 
 ## License
