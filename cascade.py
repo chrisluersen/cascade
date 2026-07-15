@@ -46,6 +46,11 @@ def _load_env(path: str = ".env"):
 
 _load_env()
 
+# Fallback: if BWS_ACCESS_TOKEN isn't set (no cascade .env), try Hermes Agent's .env
+if not os.environ.get("BWS_ACCESS_TOKEN", "").strip():
+    hermes_env = os.path.expanduser("~/AppData/Local/hermes/.env")
+    _load_env(hermes_env)
+
 logging.basicConfig(
     level=getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO),
     format="%(asctime)s [%(levelname)s] %(message)s",
