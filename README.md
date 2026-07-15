@@ -12,6 +12,10 @@
 [![Providers](https://img.shields.io/badge/providers-36_│_5_cost_tiers-8b5cf6)](#supported-providers)
 [![Dual SDK](https://img.shields.io/badge/SDK-OpenAI_∷_Anthropic-ff6b6b)](#quick-start)
 [![Key source](https://img.shields.io/badge/keys-Bitwarden_Secrets_Manager-3b82f6)](#bitwarden-integration)
+[![llm-router](https://img.shields.io/badge/topic-llm--router-4ade80)](#)
+[![ai-gateway](https://img.shields.io/badge/topic-ai--gateway-4ade80)](#)
+[![cost-optimization](https://img.shields.io/badge/topic-cost--optimization-4ade80)](#)
+[![failover](https://img.shields.io/badge/topic-failover-4ade80)](#)
 
 ```mermaid
 flowchart LR
@@ -96,7 +100,7 @@ Free LLM tiers are generous but unreliable — rate limits, deprecations, and ou
 
 ## Architecture
 
-A single Python file (~2800 lines) running Flask/Waitress. One request flows through:
+A main server module (`cascade.py`, ~2575 lines) plus support libraries (`cascade_lib/auth.py`, `cascade_lib/cache.py`) running Flask/Waitress. One request flows through:
 
 ```
   ┌──────────┐   OpenAI-format request    ┌──────────────────────────────────────────────┐
@@ -149,7 +153,7 @@ cascade loads all API keys from **Bitwarden Secrets Manager** at startup via the
 2. Bitwarden (49 secrets, loaded at startup)
 3. `.env` / system environment (legacy fallback)
 
-All sources are deduped and order-preserved. See [`documentation/bitwarden.md`](documentation/bitwarden.md) for setup guide.
+Key names are resolved through three strategies: exact match → singular form (strip trailing 'S') → alias table (`_BW_ENV_ALIASES`), bridging gaps between Bitwarden key names and cascade's internal env var names. All sources are deduped and order-preserved. See [`documentation/bitwarden.md`](documentation/bitwarden.md) for setup guide.
 
 ## Commands
 
