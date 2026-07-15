@@ -655,7 +655,7 @@ def _build_providers() -> list[dict]:
         providers.append({
             "name":     "ollama",
             "base_url": "http://localhost:11434/v1",
-            "model":    os.environ.get("OLLAMA_MODEL", "qwen3.5:9b-16k"),
+            "model":    _BW_KEYS.get("OLLAMA_MODEL") or os.environ.get("OLLAMA_MODEL", "qwen3.5:9b-16k"),
             "keys":     ["local"],
             "cost":     3,
         })
