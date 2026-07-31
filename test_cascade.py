@@ -476,7 +476,7 @@ def test_metrics():
 def main():
     global PASS, FAIL, SKIP
 
-    print(f"═══ Cascade Router Test Suite ═══")
+    print("═══ Cascade Router Test Suite ═══")
     print(f"Target: {BASE}")
     print()
 
@@ -549,7 +549,6 @@ def main():
 # ── Direct function registration ─────────────────────────────────────────────
 # Register each test function
 
-import functools
 
 def _register_test(fn, name):
     """Register a function as a test."""
@@ -566,7 +565,7 @@ for _name in list(globals().keys()):
 
 if __name__ == "__main__":
     # Actually just run them directly — simpler
-    print(f"═══ Cascade Router Test Suite ═══")
+    print("═══ Cascade Router Test Suite ═══")
     print(f"Target: {BASE}")
     print()
 
