@@ -91,7 +91,7 @@ Free LLM tiers are generous but unreliable — rate limits, deprecations, and ou
 | **Adaptive max_tokens** | Auto-scales output budget by input length — short queries get small budgets |
 | **Tool-aware routing** | Only routes tool-call requests to providers with verified function-calling support |
 | **Payload ceiling detection** | Skips providers whose context/output limits a request would exceed |
-| **Reasoning model support** | Extra token headroom for thinking models + transparent `thinking` field handling |
+| **Reasoning model support** | Extra token headroom for thinking models + transparent `thinking` field handling + per-provider `reasoning_effort` control (`<PROVIDER>_REASONING_EFFORT`, default `medium` for nous_portal) |
 | **Embeddings routing** | Multi-provider failover — Gemini, Mistral, OpenAI, Cohere |
 | **Model auto-discovery** | Probes `/v1/models` endpoint at startup, fixes stale or renamed models |
 | **Anthropic ↔ OpenAI translation** | Transparent protocol bridge with tool-call mapping |
