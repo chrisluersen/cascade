@@ -1030,6 +1030,19 @@ def _build_providers() -> list[dict]:
         env_var = f"{p['name'].upper()}_MAX_OUTPUT_TOKENS"
         p["max_output_tokens"] = _int_env(env_var, _max_out_defaults.get(p["name"], 0))
 
+    # Per-provider reasoning effort. Reasoning models (deepseek-v4-flash etc.)
+    # spend hidden output tokens on chain-of-thought before answering. Sending a
+    # reasoning_effort level tells the API how much thinking budget to spend —
+    # cutting latency and output tokens without disabling thinking entirely.
+    # Nous portal accepts it for deepseek-v4-flash (DeepSeek thinking-mode API).
+    #   Configure via  {PROVIDER}_REASONING_EFFORT  (e.g. NOUS_PORTAL_REASONING_EFFORT=medium)
+    #   empty = don't send the field. Default: medium for nous_portal.
+    _reasoning_effort_defaults = {"nous_portal": "medium"}
+    for p in providers:
+        env_var = f"{p['name'].upper()}_REASONING_EFFORT"
+        p["reasoning_effort"] = os.environ.get(
+            env_var, _reasoning_effort_defaults.get(p["name"], "")) or ""
+
     # Per-provider embedding model. Only providers with a non-empty embed model
     # take part in /v1/embeddings routing (OpenRouter, Groq, etc. are chat-only).
     # Each uses the same base_url with an /embeddings path; the wire format is
@@ -2209,6 +2222,14 @@ def forward(provider: dict, key: str, payload: dict, streaming: bool) -> request
     # Strip top-level thinking fields (Gemini sometimes adds these)
     body.pop("think", None)
     body.pop("thinking", None)
+
+    # Inject per-provider reasoning effort. Reasoning models (deepseek-v4-flash)
+    # spend output tokens on hidden chain-of-thought; telling the API how much
+    # thinking to budget cuts latency + token cost while keeping thinking on.
+    # Empty = don't send the field (normal models ignore or reject it).
+    effort = provider.get("reasoning_effort", "")
+    if effort:
+        body["reasoning_effort"] = effort
 
     # Reasoning models spend output tokens on hidden chain-of-thought, so a small
     # client max_tokens can be entirely consumed by thinking — leaving empty
