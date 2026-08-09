@@ -60,6 +60,7 @@ cascade auto-probes each provider at startup, but you can force the result:
 | `<PROVIDER>_REASONING` | *(auto-probed)* | Force reasoning-model on/off (`1`/`0`) |
 | `<PROVIDER>_SKIP_TOKENS_OVER` | *(per provider)* | Skip this provider when an estimated request exceeds this many tokens (`0` = never) |
 | `<PROVIDER>_MAX_OUTPUT_TOKENS` | *(per provider)* | Clamp `max_tokens` down to this provider's output ceiling (`0` = no clamp) |
+| `<PROVIDER>_REASONING_EFFORT` | `medium` *(nous_portal only)* | Thinking budget sent as `reasoning_effort` for reasoning models — cuts latency/output tokens (empty = don't send) |
 
 ## Model overrides
 
