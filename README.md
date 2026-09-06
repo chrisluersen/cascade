@@ -22,7 +22,7 @@ flowchart LR
     App[Your App]
     C[cascade ✦]
     F[Free Providers<br/>NVIDIA · Z.AI · Gemini · Groq<br/>SambaNova · GitHub Models · 16 more]
-    P[Cheap Providers<br/>DeepSeek · Nous Portal · OpenAI<br/>Anthropic · OpenRouter · 5 more]
+    P[Cheap Providers<br/>DeepSeek · OpenAI · Anthropic<br/>OpenRouter · Mimo · 5 more]
     L[Local<br/>Ollama]
     App -->|"OpenAI / Anthropic SDK"| C
     C -->|"cost=0 first"| F
@@ -91,7 +91,7 @@ Free LLM tiers are generous but unreliable — rate limits, deprecations, and ou
 | **Adaptive max_tokens** | Auto-scales output budget by input length — short queries get small budgets |
 | **Tool-aware routing** | Only routes tool-call requests to providers with verified function-calling support |
 | **Payload ceiling detection** | Skips providers whose context/output limits a request would exceed |
-| **Reasoning model support** | Extra token headroom for thinking models + transparent `thinking` field handling + per-provider `reasoning_effort` control (`<PROVIDER>_REASONING_EFFORT`, default `medium` for nous_portal) |
+| **Reasoning model support** | Extra token headroom for thinking models + transparent `thinking` field handling + per-provider `reasoning_effort` control (`<PROVIDER>_REASONING_EFFORT`) |
 | **Embeddings routing** | Multi-provider failover — Gemini, Mistral, OpenAI, Cohere |
 | **Model auto-discovery** | Probes `/v1/models` endpoint at startup, fixes stale or renamed models |
 | **Anthropic ↔ OpenAI translation** | Transparent protocol bridge with tool-call mapping |
@@ -135,8 +135,8 @@ A main server module (`cascade.py`, ~2575 lines) plus support libraries (`cascad
 
 | Tier | Providers | Cost |
 |------|-----------|------|
-| **Free** | NVIDIA NIM (nemotron-3-super, 383ms, tools+reasoning), Z.AI (GLM-4.5-Flash, 638ms), Gemini (2.5 Flash Lite, 1M context), SambaNova Direct (DeepSeek-V3.2), Groq (Llama-3.3-70B, 800+ tok/s), GitHub Models (GPT-4o free), DeepInfra (Qwen2.5-72B), Fireworks (Qwen2.5-Coder-32B), Naga (Nemotron-3-Super:free), Together (Qwen3.5-9B), OVHcloud (gpt-oss-120b), Aion (gpt-4o-mini), LongCat, SiliconFlow, AI Hub Mix, HuggingFace, plus 10 OpenRouter free tiers | $0 |
-| **Cheap** | DeepSeek V4 Flash ($0.098/M), Nous Portal (same model via Nous sub), Hy3 Preview ($0.063/M, cheapest reasoning), OpenAI (gpt-4o-mini), Mimo V2.5 ($0.105/M, 1M context), Minimax-M3 ($0.30/M, 1M context), LLM7 (devstral-small-2), Together (paid tier), Anthropic (Claude Haiku 4.5) | $0.06–$0.30/M |
+| **Free** | NVIDIA NIM (nemotron-3-super, 383ms, tools+reasoning), Z.AI (GLM-4.5-Flash, 638ms), Gemini (2.5 Flash Lite, 1M context), SambaNova Direct (DeepSeek-V3.2), Groq (Llama-3.3-70B, 800+ tok/s), GitHub Models (GPT-4o free), DeepInfra (Qwen2.5-72B), Fireworks (Qwen2.5-Coder-32B), Naga (Nemotron-3-Super:free), Together (Qwen3.5-9B), OVHcloud (gpt-oss-120b), Aion (gpt-4o-mini), LongCat, SiliconFlow, HuggingFace, plus 10 OpenRouter free tiers | $0 |
+| **Cheap** | DeepSeek V4 Flash ($0.098/M), Hy3 Preview ($0.063/M, cheapest reasoning), OpenAI (gpt-4o-mini), Mimo V2.5 ($0.105/M, 1M context), Minimax-M3 ($0.30/M, 1M context), LLM7 (devstral-small-2), Together (paid tier), Anthropic (Claude Haiku 4.5) | $0.06–$0.30/M |
 | **Premium** | DeepSeek V4 Pro ($0.435/M), GLM-5.2 ($0.93/M), Claude Sonnet 5 ($2/M), Claude Sonnet 4.6 ($3/M) | $0.44–$3/M |
 | **Local** | Ollama (any local model, default qwen3.5:9b) | $0 |
 
