@@ -92,14 +92,23 @@ PROMPT_ROUTE_RULES = [
     {"match": ["creative", "write", "story", "essay", "blog", "poem", "script"], "tier": 1, "model": "openai/gpt-4o", "label": "creative", "negative": []},
     # Fast/simple -> cheapest capable model
     {"match": ["fast", "simple", "quick", "brief", "one sentence", "yes or no", "what is", "who is", "define", "spell", "explain simply", "tldr"], "tier": 1, "model": "deepseek/deepseek-v4-flash", "label": "fast", "negative": ["translate to python", "convert to python", "migrate to python"]},
-    # Complex engineering -> medium/premium
-    {"match": ["architect", "design", "implement", "refactor", "algorithm", "optimize", "research", "step by step", "walk me through", "plan", "review", "compare", "analyze"], "tier": 2, "model": "anthropic/claude-sonnet-5", "label": "complex", "negative": []},
+    # Complex engineering -> medium/premium (strict pin — never silently downgrade)
+        {"match": ["architect", "design", "implement", "refactor", "algorithm", "optimize", "research", "step by step", "walk me through", "plan", "review", "compare", "analyze"], "tier": 2, "model": "anthropic/claude-sonnet-5", "label": "complex", "strict": True, "negative": []},
     # Long-context -> large context models
     {"match": ["context", "long", "document", "migrate", "convert", "summarize"], "tier": 1, "model": "minimax-m3", "label": "long_context", "negative": ["summarize in one sentence", "tldr"]},
     # Removed overly greedy fallback; let cost cascade handle greetings.
 ]
 
-def _pick_model_by_prompt(messages: list) -> str | None:
+def _pick_model_by_prompt(messages: list) -> tuple[str | None, bool]:
+    """Return (model, strict) for a matched prompt-route rule.
+
+    strict=False (default): the model is a *soft* preference — if the model's
+    provider is unavailable or fails (auth/502/402), cascade falls back to the
+    normal cost cascade rather than dead-ending. Used for low-stakes rules
+    (fast/simple/code) where a healthy provider is an acceptable substitute.
+    strict=True: the model is a *hard* requirement — cascade must not silently
+    downgrade (e.g. complex engineering must not silently drop to a free model).
+    """
     content = " ".join(
         m["content"] if isinstance(m.get("content"), str) else " ".join(p.get("text", "") for p in m["content"] if isinstance(p, dict))
         for m in messages if m.get("content")
@@ -120,8 +129,8 @@ def _pick_model_by_prompt(messages: list) -> str | None:
             # Long prompts should not be force-routed to tiny free models.
             if tier == 0 and tokens > 400:
                 continue
-            return rule["model"]
-    return None
+            return rule["model"], bool(rule.get("strict", False))
+    return None, False
 
 
 FAST_ROUTE_TOKENS = int(os.environ.get("FAST_ROUTE_THRESHOLD", 200)) # 0 = disabled, 50-200 recommended
@@ -171,7 +180,6 @@ KNOWN_MODEL_COSTS: dict = {
     "nvidia/deepseek-ai/deepseek-v4-flash": (0.0, 0.0), # free on OR
 
     # Paid OpenRouter models
-    "deepseek/deepseek-v4-flash":   (0.098,  0.196),    # daily driver, cheapest paid
     "deepseek/deepseek-v4-pro":     (0.435,  0.87),     # frontier
     "tencent/hy3-preview":          (0.063,  0.21),     # cheapest reasoning
     "xiaomi/mimo-v2.5":             (0.105,  0.28),     # cheap, 1M ctx
@@ -185,7 +193,7 @@ KNOWN_MODEL_COSTS: dict = {
     "devstral-small-2:24b":         (0.15,   0.60),     # llm7 paid tier
 
     # Paid via Nous sub
-    "deepseek/deepseek-v4-flash":   (0.098,  0.196),    # nous_portal, same as OR
+    "deepseek/deepseek-v4-flash":   (0.098,  0.196),    # OpenRouter paid
 
     # Local
     "qwen3.5:9b-16k":               (0.0,    0.0),      # ollama local
@@ -340,7 +348,7 @@ BREAKER_COOLDOWN    = int(os.environ.get("BREAKER_COOLDOWN", 60))       # second
 # Providers known for low-latency inference — promoted for short requests
 _FAST_PROVIDERS = {"groq", "zai", "github_models", "gemini",
                      "sambanova_direct", "nvidia_nim", "naga",
-                     "openai", "nous_portal", "deepseek-v4-flash",
+                     "openai", "deepseek-v4-flash",
                      "ovhcloud", "aion", "deepinfra", "together"}
 
 # Per-request counter for round-robin among equally-rated providers.
@@ -363,7 +371,7 @@ KNOWN_MODEL_RATINGS: dict = {
     "deepseek-v4-flash": 2, "deepseek-v4": 2,
     "deepseek-v3": 2, "deepseek-v2": 2,
     "gemini-2.5-flash": 2,
-    "llama-3.3-70b": 2, "llama-3.1-70b": 2, "llama-4-maverick": 2, "llama-4-scout": 2,
+    "llama-3.3-70b": 2, "llama-3.1-70b": 2, "llama-4-maverick": 2,
     "claude-3-5": 2, "claude-haiku": 2,
     "mistral-large": 2, "command-a": 2,
     "nvidia/nemotron-3-super": 2, "nemotron": 2,
@@ -397,10 +405,9 @@ KNOWN_MODEL_RATINGS: dict = {
     "gemini-1.5-flash-8b": 4,
     "command-r7b": 4,
     "mistral-7b": 4,
-    "qwen2.5-7b": 4, "qwen3-4b": 4,
+    "qwen2.5-7b": 4,
     "phi-3.5": 4, "phi-3-medium": 4,
     "mixtral-8x7b": 4,
-    "llama-4-scout": 4,
     "yi-medium": 4, "yi-6b": 4,
     "tencent/hy3-preview": 4,
 
@@ -630,16 +637,6 @@ def _build_providers() -> list[dict]:
     # ════════════════════════════════════════════════════════════
     # Tier 3 — Paid (only when free tiers truly can't handle it)
     # ════════════════════════════════════════════════════════════
-
-    nous_portal_keys = _keys_for("nous_portal", "NOUS_PORTAL_API_KEYS")
-    if nous_portal_keys:
-        providers.append({
-            "name":     "nous_portal",
-            "base_url": "https://inference-api.nousresearch.com/v1",
-            "model":    os.environ.get("NOUS_PORTAL_MODEL", "deepseek/deepseek-v4-flash"),
-            "keys":     nous_portal_keys,
-            "cost":     1,
-        })
 
     openai_keys = _keys_for("openai", "OPENAI_API_KEYS")
     if openai_keys:
@@ -991,17 +988,6 @@ def _build_providers() -> list[dict]:
             "cost":     0,
         })
 
-    # ── AI Hub Mix (free tier — 2 RPM, 100K context) ─────────────────────
-    aihubmix_keys = _keys_for("aihubmix", "AIHUBMIX_API_KEY")
-    if aihubmix_keys:
-        providers.append({
-            "name":     "aihubmix",
-            "base_url": "https://api.aihubmix.com/v1",
-            "model":    os.environ.get("AIHUBMIX_MODEL", "coding-glm-5.2-free"),
-            "keys":     aihubmix_keys,
-            "cost":     0,
-        })
-
     if not providers:
         log.warning("No providers configured — set GEMINI_API_KEYS, OPENROUTER_API_KEYS, etc. in .env")
 
@@ -1036,8 +1022,8 @@ def _build_providers() -> list[dict]:
     # cutting latency and output tokens without disabling thinking entirely.
     # Nous portal accepts it for deepseek-v4-flash (DeepSeek thinking-mode API).
     #   Configure via  {PROVIDER}_REASONING_EFFORT  (e.g. NOUS_PORTAL_REASONING_EFFORT=medium)
-    #   empty = don't send the field. Default: medium for nous_portal.
-    _reasoning_effort_defaults = {"nous_portal": "medium"}
+    #   empty = don't send the field.
+    _reasoning_effort_defaults = {}
     for p in providers:
         env_var = f"{p['name'].upper()}_REASONING_EFFORT"
         p["reasoning_effort"] = os.environ.get(
@@ -1571,11 +1557,6 @@ class ProviderStats:
                 "completion_tokens": s.get("completion_tokens", 0),
             }
 
-    def all_summaries(self) -> dict:
-        with self.lock:
-            return {name: self.summary(name) for name in self._data}
-
-
 stats = ProviderStats()
 
 # ── Response cache ─────────────────────────────────────────────────────────────
@@ -1784,7 +1765,6 @@ def _anthropic_streaming_generator(resp: requests.Response):
     model        = ""
     created      = int(time.time())
     finish_reason = "stop"
-    first_chunk  = True
 
     buf = b""
     for raw_chunk in resp.iter_content(chunk_size=None):
@@ -1812,8 +1792,6 @@ def _anthropic_streaming_generator(resp: requests.Response):
                          "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""},
                                       "finish_reason": None}]}
                 yield ("data: " + json.dumps(chunk) + "\n\n").encode()
-                first_chunk = False
-
             elif etype == "content_block_delta":
                 delta = event.get("delta", {})
                 if delta.get("type") == "text_delta":
@@ -2390,12 +2368,30 @@ def _route_completion(payload: dict, streaming: bool):
 
     # Prompt-based routing: if the user supplied a matching keyword rule,
     # pin the model for this request BEFORE provider selection so the
-    # cascade uses only providers that serve that model.
-    _prompt_model = _pick_model_by_prompt(messages)
+    # cascade uses only providers that serve that model. NEVER let a prompt
+    # pin dead-end the request: if the pinned model has no *available*
+    # provider (auth/402/502/probe-fail), fall back to the cost cascade so
+    # the request still routes. Strict rules (complex) still *prefer* the
+    # pinned model and only degrade when it is genuinely unreachable;
+    # soft rules degrade the same way. A documented degradation beats a
+    # hard "All providers exhausted".
+    _prompt_model, _prompt_strict = _pick_model_by_prompt(messages)
     if _prompt_model:
-        log.info("[%s] → prompt-route matched model=%s", trace_id, _prompt_model)
-        payload = dict(payload)
-        payload["model"] = _prompt_model
+        _pinned_served = any(
+            p.get("model") == _prompt_model and
+            _provider_state.get(p["name"], {}).get("available", True)
+            for p in PROVIDERS
+        )
+        if _pinned_served:
+            log.info("[%s] → prompt-route matched model=%s (strict=%s) — pinning",
+                     trace_id, _prompt_model, _prompt_strict)
+            payload = dict(payload)
+            payload["model"] = _prompt_model
+        else:
+            log.warning(
+                "[%s] → prompt-route model=%s (strict=%s) has no available "
+                "provider — using cost cascade instead of dead-ending",
+                trace_id, _prompt_model, _prompt_strict)
 
     ordered    = _ordered_providers(payload)
 
