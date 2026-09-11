@@ -233,14 +233,16 @@ _FREE_ONLY_TRUE   = {"1", "true", "yes", "on", "y"}
 
 
 def _model_is_free(model: str) -> bool:
-    """True if the model is priced at zero (or unpriced → free-safe default).
+    """True only if the model is EXPLICITLY priced at zero in the table.
 
-    The pricing table treats a missing entry as $0 (free-tier safe default, see
-    KNOWN_MODEL_COSTS docstring), so an unpriced model counts as free. A model
-    with any non-zero input/output price is paid.
+    Deny-by-default: a model with no pricing-table entry is treated as PAID,
+    not free. The original "unpriced → free-safe default" was a leak — an
+    unpriced paid model counted as free and passed the free-only gate. An
+    unknown model is exactly the case this gate must fail closed on, so both
+    the empty-model case and the no-entry case return False.
     """
     if not model:
-        return True
+        return False
     if model in KNOWN_MODEL_COSTS:
         inp, out = KNOWN_MODEL_COSTS[model]
         return inp == 0.0 and out == 0.0
@@ -248,20 +250,25 @@ def _model_is_free(model: str) -> bool:
     for key, (inp, out) in sorted(KNOWN_MODEL_COSTS.items(), key=lambda x: -len(x[0])):
         if key in model:
             return inp == 0.0 and out == 0.0
-    return True   # unpriced → free-safe default
+    return False   # unpriced → NOT free (deny; an unpriced paid model must not leak)
 
 
-def _provider_is_free(provider: dict) -> bool:
+def _provider_is_free(provider: dict, model_key: str = "model") -> bool:
     """True only if the provider is free by BOTH signals we trust.
 
-    Requires cost == 0 (the explicit tier flag) AND a free model price. Using
-    both means a mislabelled provider can't leak through on one weak signal:
-    cost==0 alone would pass a paid model pinned under a free-cost provider,
-    and a (0,0) price alone would pass a provider whose cost tier says paid.
+    Requires cost == 0 (the explicit tier flag) AND an explicitly-zero model
+    price. Using both means a mislabelled provider can't leak through on one
+    weak signal: cost==0 alone would pass a paid model pinned under a free-cost
+    provider, and a (0,0) price alone would pass a provider whose cost tier says
+    paid.
+
+    model_key selects which of the provider's models to price-check: "model"
+    (the chat model, the default) or "embed_model" for /v1/embeddings, whose
+    cost is driven by a different model id.
     """
     if provider.get("cost", 1) != 0:
         return False
-    return _model_is_free(provider.get("model", ""))
+    return _model_is_free(provider.get(model_key, ""))
 
 
 def _free_only_requested(payload: dict) -> bool:
@@ -2171,7 +2178,7 @@ def _supports_tools(provider: dict) -> bool:
     return True if val is None else bool(val)
 
 
-def _ordered_providers(payload: dict) -> list[dict]:
+def _ordered_providers(payload: dict, free_only: bool = False) -> list[dict]:
     """
     Smart complexity-aware ordering: use cheapest capable model for simple
     tasks, best model for complex ones. With FAST_ROUTE_THRESHOLD set,
@@ -2180,6 +2187,13 @@ def _ordered_providers(payload: dict) -> list[dict]:
     If prompt-based routing has already pinned a specific model, restrict
     to providers that can actually serve that model; otherwise the cascade
     would still try every provider and silently override the choice.
+
+    free_only=True additionally drops every provider that is not genuinely
+    free. That filter is applied to the model-pin branch too — a request whose
+    model names a paid model explicitly must not slip past the gate just
+    because a provider advertises that model (an earlier version filtered only
+    the final ordering, leaving the pin branch open). Ordering and filtering
+    happen in the same place so no caller can get an unfiltered list.
     """
     messages          = payload.get("messages", [])
     complexity        = classify_complexity(messages)
@@ -2188,11 +2202,25 @@ def _ordered_providers(payload: dict) -> list[dict]:
 
     if requested_model and requested_model not in ("", CASCADE_MODEL, "auto", "any"):
         matching = [p for p in PROVIDERS if p.get("model") == requested_model]
+        if free_only:
+            # Leak path: an explicit paid model pin used to reach the provider
+            # list unfiltered. Drop paid matches here, and fall through to the
+            # free-filtered general ordering if nothing free serves it.
+            matching = [p for p in matching if _provider_is_free(p)]
         if matching:
             providers = matching
             log.info("→ model-pin %s -> providers=%s", requested_model, [p["name"] for p in providers])
 
     ordered = _get_smart_ordered(providers, complexity, _estimated_tokens(messages))
+
+    if free_only:
+        before  = ordered
+        ordered = [p for p in before if _provider_is_free(p)]
+        if len(ordered) < len(before):
+            log.info("≋ free-only: excluded %d paid provider(s): %s",
+                     len(before) - len(ordered),
+                     [p["name"] for p in before if not _provider_is_free(p)])
+
     log.info(f"→ complexity={complexity} ({_COMPLEXITY_LABELS[complexity]}) "
              f"order={[p['name'] for p in ordered]}")
     return ordered
@@ -2300,7 +2328,7 @@ def forward(provider: dict, key: str, payload: dict, streaming: bool) -> request
         return (None, was_clamped)
 
 
-def _embed_ordered() -> list[dict]:
+def _embed_ordered(free_only: bool = False) -> list[dict]:
     """Embedding-capable providers in a STABLE priority order — deliberately NOT
     round-robined like chat. Different providers return different vector
     dimensions (e.g. gemini 3072, cohere 1536, mistral 1024), and vectors of
@@ -2309,9 +2337,21 @@ def _embed_ordered() -> list[dict]:
     actually down. Open breakers and unhealthy providers sink to the back; the
     sort is stable, so healthy providers keep their config order as the priority.
 
+    free_only=True drops providers that are not genuinely free, priced on their
+    EMBED model (not the chat model) — /v1/embeddings otherwise ignored the
+    free-only opt-in entirely and could silently select a paid provider.
+
     For STRICT single-dimension guarantees, disable the others' embed models
     (e.g. MISTRAL_EMBED_MODEL= and COHERE_EMBED_MODEL= empty in .env)."""
     embed_providers = [p for p in PROVIDERS if p.get("embed_model")]
+    if free_only:
+        before = embed_providers
+        embed_providers = [p for p in before if _provider_is_free(p, "embed_model")]
+        if len(embed_providers) < len(before):
+            log.info("≋ free-only: excluded %d paid embedding provider(s): %s",
+                     len(before) - len(embed_providers),
+                     [p["name"] for p in before
+                      if not _provider_is_free(p, "embed_model")])
     return sorted(embed_providers, key=lambda p: (1 if stats.breaker_open(p["name"]) else 0,
                                                   stats.health_bucket(p["name"])))
 
@@ -2473,28 +2513,21 @@ def _route_completion(payload: dict, streaming: bool):
                 "provider — using cost cascade instead of dead-ending",
                 trace_id, _prompt_model, _prompt_strict)
 
-    ordered    = _ordered_providers(payload)
+    ordered    = _ordered_providers(payload, free_only=free_only)
 
-    # FREE-ONLY hard filter: drop every candidate that isn't genuinely free,
-    # applied AFTER ordering so it also strips the model-pin path (a request
-    # pinned to a paid model has no free provider and ends up empty → clear
-    # error below, never a silent paid fall-through).
-    if free_only:
-        free_ordered = [p for p in ordered if _provider_is_free(p)]
-        if len(free_ordered) < len(ordered):
-            log.info("[%s] ≋ free-only: excluded %d paid provider(s): %s",
-                     trace_id, len(ordered) - len(free_ordered),
-                     [p["name"] for p in ordered if not _provider_is_free(p)])
-        ordered = free_ordered
-        if not ordered:
-            log.error("[%s] ≋ free-only: no free provider can serve this request", trace_id)
-            return ("error", {"error": {
-                "message": ("Free-only mode is enabled (X-Cascade-Free-Only or model "
-                            "'cascade-free') but no free provider can serve this request. "
-                            "Paid providers are excluded by request. Remove the opt-in to "
-                            "allow paid providers."),
-                "type": "router_error",
-                "code": "free_only_no_provider"}}, 503)
+    # FREE-ONLY hard gate. _ordered_providers has already dropped every paid
+    # candidate — including the model-pin branch — so an empty list here means
+    # no free provider can serve this request. Fail closed with a clear error;
+    # never silently fall through to a paid provider.
+    if free_only and not ordered:
+        log.error("[%s] ≋ free-only: no free provider can serve this request", trace_id)
+        return ("error", {"error": {
+            "message": ("Free-only mode is enabled (X-Cascade-Free-Only or model "
+                        "'cascade-free') but no free provider can serve this request. "
+                        "Paid providers are excluded by request. Remove the opt-in to "
+                        "allow paid providers."),
+            "type": "router_error",
+            "code": "free_only_no_provider"}}, 503)
 
     # Filter providers whose startup probe returned unavailable (e.g. auth
     # failures, model-id mismatches). This avoids wasting a round-trip on
@@ -2526,8 +2559,21 @@ def _route_completion(payload: dict, streaming: bool):
     # always make forward progress instead of hard-failing while options remain.
     any_closed = any(not stats.breaker_open(p["name"]) for p in ordered)
 
+    # Request-scoped provider-failure exclusion. A provider that already failed
+    # in THIS request is not retried — its remaining keys would hit the same
+    # outage and only burn latency before the cascade moves on. This is per
+    # request (a fresh set each call), so the next request starts clean and can
+    # still probe the provider.
+    failed_providers: set[str] = set()
+
     for provider in ordered:
         name     = provider["name"]
+
+        # Already failed this request → never retry it (belt-and-braces: the
+        # filter below also strips candidates before they are reached).
+        if name in failed_providers:
+            log.info("[%s] ⨂ skipping %s (already failed this request)", trace_id, name)
+            continue
 
         # Breaker open → skip (unless all are open, then probe everything).
         if any_closed and stats.breaker_open(name):
@@ -2569,11 +2615,16 @@ def _route_completion(payload: dict, streaming: bool):
                     stats.record_error(name)
                     stats.record_health(name, False)   # network/timeout = provider health failure
                     pool.mark_rate_limited(name, key, retry_after=30)
-                    continue
+                    # Provider-level failure: do NOT retry this provider with its
+                    # remaining keys — the outage is the provider, not the key.
+                    failed_providers.add(name)
+                    break
 
                 if resp.status_code == 429:
                     stats.record_error(name)
                     # 429 is NOT a health failure — key cooldown already handles it.
+                    # A different key is a different credential, so rotating keys
+                    # is not "retrying a failed provider"; keep doing it.
                     retry_after = _parse_retry_after(resp.headers.get("Retry-After"))
                     pool.mark_rate_limited(name, key, retry_after=retry_after)
                     log.warning("[%s]   %s 429 — cooldown %ds, trying next key", trace_id, name, retry_after)
@@ -2581,7 +2632,9 @@ def _route_completion(payload: dict, streaming: bool):
 
                 if resp.status_code in (400, 401, 403):
                     stats.record_error(name)
-                    # request/auth-specific — NOT a provider health failure.
+                    # request/auth-specific — NOT a provider health failure,
+                    # but this request will not succeed here: exclude it.
+                    failed_providers.add(name)
                     log.error("[%s]   %s %d — skipping provider: %s",
                               trace_id, name, resp.status_code, resp.text[:200])
                     break
@@ -2589,6 +2642,7 @@ def _route_completion(payload: dict, streaming: bool):
                 if resp.status_code == 413:
                     stats.record_error(name)
                     # payload-specific — NOT a provider health failure.
+                    failed_providers.add(name)
                     log.warning("[%s]   %s 413 — payload too large, cascading", trace_id, name)
                     break
 
@@ -2596,11 +2650,14 @@ def _route_completion(payload: dict, streaming: bool):
                     stats.record_error(name)
                     stats.record_health(name, False)   # 5xx = provider health failure
                     pool.mark_rate_limited(name, key, retry_after=15)
-                    continue
+                    # Provider is down — retrying its other keys is pointless.
+                    failed_providers.add(name)
+                    break
 
                 if not (200 <= resp.status_code < 300):
                     stats.record_error(name)
                     stats.record_health(name, False)   # unexpected non-2xx = health failure
+                    failed_providers.add(name)
                     log.warning("[%s]   %s unexpected %d — skipping provider", trace_id, name, resp.status_code)
                     break
 
@@ -2705,8 +2762,19 @@ def embeddings():
         return jsonify({"error": {"message": "request body must be a JSON object with an 'input' field",
                                   "type": "invalid_request_error"}}), 400
 
-    ordered = _embed_ordered()
+    # Free-only opt-in is request-scoped here too: /v1/embeddings must honour
+    # X-Cascade-Free-Only / the cascade-free alias, or it becomes a paid leak.
+    free_only = _free_only_requested(payload)
+    ordered = _embed_ordered(free_only=free_only)
     if not ordered:
+        if free_only:
+            return jsonify({"error": {
+                "message": ("Free-only mode is enabled (X-Cascade-Free-Only or model "
+                            "'cascade-free') but no free embedding-capable provider "
+                            "can serve this request. Paid providers are excluded by "
+                            "request. Remove the opt-in to allow paid providers."),
+                "type": "router_error",
+                "code": "free_only_no_provider"}}), 503
         return jsonify({"error": {"message": "no embedding-capable providers configured "
                                              "(set e.g. GEMINI_API_KEYS or MISTRAL_API_KEYS)",
                                   "type": "router_error"}}), 503
@@ -2719,8 +2787,14 @@ def embeddings():
 
     any_closed = any(not stats.breaker_open(p["name"]) for p in ordered)
 
+    # Request-scoped provider-failure exclusion (see _route_completion).
+    failed_providers: set[str] = set()
+
     for provider in ordered:
         name = provider["name"]
+        if name in failed_providers:
+            log.info(f"⨂ skipping {name} embeddings (already failed this request)")
+            continue
         if any_closed and stats.breaker_open(name):
             log.info(f"⨂ skipping {name} embeddings (circuit open)")
             continue
@@ -2740,7 +2814,8 @@ def embeddings():
             if resp is None:
                 stats.record_error(name); stats.record_health(name, False)
                 pool.mark_rate_limited(name, key, retry_after=30)
-                continue
+                failed_providers.add(name)   # provider down — don't retry other keys
+                break
             if resp.status_code == 429:
                 stats.record_error(name)
                 pool.mark_rate_limited(name, key, retry_after=_parse_retry_after(resp.headers.get("Retry-After")))
@@ -2748,14 +2823,17 @@ def embeddings():
                 continue
             if resp.status_code in (400, 401, 403, 404):
                 stats.record_error(name)   # request/auth/model-specific, not a health failure
+                failed_providers.add(name)
                 log.error(f"  {name} embeddings {resp.status_code} — skipping provider: {resp.text[:200]}")
                 break
             if resp.status_code >= 500:
                 stats.record_error(name); stats.record_health(name, False)
                 pool.mark_rate_limited(name, key, retry_after=15)
-                continue
+                failed_providers.add(name)   # provider down — don't retry other keys
+                break
             if not (200 <= resp.status_code < 300):
                 stats.record_error(name); stats.record_health(name, False)
+                failed_providers.add(name)
                 log.warning(f"  {name} embeddings unexpected {resp.status_code} — skipping provider")
                 break
 
