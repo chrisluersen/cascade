@@ -546,6 +546,223 @@ def main():
     return 0 if FAIL == 0 else 1
 
 
+# ── Free-Only Mode (unit tests — no server required) ─────────────────────────
+# These import cascade.py directly and exercise the router's own code, so they
+# verify the FEATURE implementation rather than whatever the live server happens
+# to be running. They never restart the service.
+#
+# The three required cases:
+#   4a  free-only ON excludes every paid provider from the candidate list
+#   4b  a provider that just failed is not retried in the same request
+#   4c  free-only OFF restores the previous behaviour unchanged
+# plus the two gate-level leak paths (unpriced model; /v1/embeddings).
+
+import importlib.util as _ilu
+
+_CASCADE_MOD = None
+
+
+def _load_cascade():
+    """Import cascade.py from this file's directory, once, in-process."""
+    global _CASCADE_MOD
+    if _CASCADE_MOD is not None:
+        return _CASCADE_MOD
+    here = os.path.dirname(os.path.abspath(__file__))
+    spec = _ilu.spec_from_file_location("cascade_under_test", os.path.join(here, "cascade.py"))
+    mod = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(mod)          # __main__ guard means no server starts
+    _CASCADE_MOD = mod
+    return mod
+
+
+# Synthetic provider set: two genuinely free, two paid (one of them with a
+# free-PRICED model so only the dual gate catches it), one unpriced.
+_FO_PROVIDERS = [
+    {"name": "free_a",   "model": "gemini-2.5-flash-lite",     "cost": 0},
+    {"name": "free_b",   "model": "llama-3.3-70b-versatile",   "cost": 0},
+    {"name": "paid_a",   "model": "anthropic/claude-sonnet-5", "cost": 2},
+    {"name": "paid_b",   "model": "gpt-4o-mini",               "cost": 1},
+    {"name": "unpriced", "model": "totally-unpriced-model-xyz", "cost": 0},
+]
+
+
+@test("Free-only ON excludes every paid provider from the candidate list (4a)")
+def test_free_only_on_excludes_paid():
+    c = _load_cascade()
+    saved = c.PROVIDERS
+    try:
+        c.PROVIDERS = _FO_PROVIDERS
+        payload = {"model": "cascade", "messages": [{"role": "user", "content": "hi"}]}
+
+        free = [p["name"] for p in c._ordered_providers(payload, free_only=True)]
+        assert "paid_a" not in free, f"paid_a leaked into free-only candidates: {free}"
+        assert "paid_b" not in free, f"paid_b (free-priced model, paid tier) leaked: {free}"
+        assert "unpriced" not in free, f"unpriced provider leaked (should deny): {free}"
+        assert set(free) == {"free_a", "free_b"}, f"unexpected free-only candidate set: {free}"
+
+        # Free-only OFF must include the paid providers — proves the flag, not
+        # something else, is what removed them.
+        allp = [p["name"] for p in c._ordered_providers(payload, free_only=False)]
+        assert {"paid_a", "paid_b"} <= set(allp), \
+            f"paid providers missing when free-only OFF: {allp}"
+
+        # Leak path (b): an explicit paid model pin must not be honoured. With
+        # free providers available it falls through to the free cascade; the
+        # pinned paid provider must be gone.
+        pin_payload = {"model": "anthropic/claude-sonnet-5",
+                       "messages": [{"role": "user", "content": "hi"}]}
+        pinned_names = [p["name"] for p in c._ordered_providers(dict(pin_payload), free_only=True)]
+        assert "paid_a" not in pinned_names, \
+            f"explicit paid model pin leaked past free-only: {pinned_names}"
+        assert all(c._provider_is_free(p) for p in
+                   c._ordered_providers(dict(pin_payload), free_only=True)), \
+            f"non-free provider in free-only candidates: {pinned_names}"
+
+        # ...and the pin still restricts exactly as before with free-only OFF.
+        pin_off = [p["name"] for p in c._ordered_providers(dict(pin_payload), free_only=False)]
+        assert pin_off == ["paid_a"], f"model-pin behaviour changed with free-only OFF: {pin_off}"
+    finally:
+        c.PROVIDERS = saved
+
+
+@test("Free-only ON fails closed with 503 when no free provider can serve")
+def test_free_only_fails_closed():
+    c = _load_cascade()
+    saved = c.PROVIDERS
+    try:
+        # Every provider is non-free (paid tier, or unpriced which is now denied).
+        c.PROVIDERS = [p for p in _FO_PROVIDERS if not c._provider_is_free(p)]
+        assert c.PROVIDERS, "test fixture has no non-free providers"
+        with c.app.test_request_context("/v1/chat/completions", method="POST", json={},
+                                        headers={c.FREE_ONLY_HEADER: "true"}):
+            r = c._route_completion(
+                {"model": "cascade", "messages": [{"role": "user", "content": "hi"}]}, False)
+        assert r[0] == "error", f"expected an error result, got {r!r}"
+        assert r[2] == 503, f"expected HTTP 503, got {r[2]}"
+        assert r[1]["error"]["code"] == "free_only_no_provider", f"wrong error code: {r[1]}"
+    finally:
+        c.PROVIDERS = saved
+
+
+@test("A provider that just failed is not retried in the same request (4b)")
+def test_failed_provider_not_retried():
+    c = _load_cascade()
+
+    class _Pool:
+        def __init__(self, names):
+            self.pools = {n: ["key1", "key2"] for n in names}   # two keys each
+        def get_key(self, name):
+            lst = self.pools.get(name, [])
+            return lst[0] if lst else None
+        def mark_rate_limited(self, *a, **k):
+            pass
+
+    class _Stats:
+        def breaker_open(self, name): return False
+        def health_bucket(self, name): return 0
+        def record_error(self, *a, **k): pass
+        def record_health(self, *a, **k): pass
+        def record_success(self, *a, **k): pass
+        def record_trace(self, *a, **k): pass
+        def record_cost(self, *a, **k): pass
+
+    class _Bulkhead:
+        def try_acquire(self, name): return True
+        def release(self, name): pass
+
+    class _Cache:
+        def get(self, payload): return None
+        def set(self, payload, data): pass
+
+    calls = []
+    def _fail_forward(provider, key, payload, streaming):
+        calls.append((provider["name"], key))
+        return (None, False)              # network failure on every attempt
+
+    saved = (c.PROVIDERS, c.pool, c.stats, c.bulkhead, c.cache, c.forward)
+    try:
+        c.PROVIDERS = [{"name": "flaky", "model": "gemini-2.5-flash-lite", "cost": 0}]
+        c.pool, c.stats, c.bulkhead, c.cache = _Pool(["flaky"]), _Stats(), _Bulkhead(), _Cache()
+        c.forward = _fail_forward
+        with c.app.test_request_context("/v1/chat/completions", method="POST", json={}):
+            kind, body, status = c._route_completion(
+                {"model": "cascade", "messages": [{"role": "user", "content": "hi"}]}, False)
+
+        assert kind == "error" and status == 503, f"expected 503 error, got {kind}/{status}"
+        # Two keys are configured; a failing provider must be tried exactly once
+        # (old behaviour looped over both keys before cascading).
+        assert len(calls) == 1, \
+            f"failed provider was retried in the same request: {len(calls)} attempts {calls}"
+    finally:
+        (c.PROVIDERS, c.pool, c.stats, c.bulkhead, c.cache, c.forward) = saved
+
+
+@test("Free-only OFF restores previous behaviour unchanged (4c)")
+def test_free_only_off_unchanged():
+    c = _load_cascade()
+    saved = c.PROVIDERS
+    try:
+        c.PROVIDERS = _FO_PROVIDERS
+        payload = {"model": "cascade", "messages": [{"role": "user", "content": "hi"}]}
+
+        # No filtering whatsoever when the flag is off.
+        off = [p["name"] for p in c._ordered_providers(payload, free_only=False)]
+        assert set(off) == {p["name"] for p in _FO_PROVIDERS}, \
+            f"free-only OFF filtered providers: {off}"
+
+        # Opt-in detection is off by default...
+        with c.app.test_request_context("/", method="POST", json={}):
+            assert c._free_only_requested({"model": "cascade"}) is False, \
+                "free-only requested without header or alias"
+        # ...and turns on via the header (case/whitespace tolerant)...
+        with c.app.test_request_context("/", method="POST", json={},
+                                        headers={c.FREE_ONLY_HEADER: "  YES "}):
+            assert c._free_only_requested({"model": "cascade"}) is True, \
+                "free-only header not honoured"
+        # ...or via the cascade-free alias.
+        with c.app.test_request_context("/", method="POST", json={}):
+            assert c._free_only_requested({"model": "cascade-free"}) is True, \
+                "cascade-free alias not honoured"
+    finally:
+        c.PROVIDERS = saved
+
+
+@test("Free-only pricing gate denies unpriced models and keeps free ones")
+def test_model_is_free_gate():
+    c = _load_cascade()
+    assert c._model_is_free("gemini-2.5-flash-lite") is True, "known free model rejected"
+    assert c._model_is_free("anthropic/claude-sonnet-5") is False, "known paid model accepted"
+    assert c._model_is_free("totally-unpriced-model-xyz") is False, \
+        "unpriced model treated as free (leak)"
+    assert c._model_is_free("") is False, "empty model treated as free (leak)"
+    # Dual gate: a paid TIER provider must not pass even with a free-priced model.
+    assert c._provider_is_free({"name": "x", "model": "gpt-4o-mini", "cost": 1}) is False, \
+        "paid-tier provider with a free-priced model passed the gate"
+    assert c._provider_is_free({"name": "x", "model": "gemini-2.5-flash-lite", "cost": 0}) is True, \
+        "genuinely free provider rejected"
+
+
+@test("/v1/embeddings honours free-only (leak path d)")
+def test_embeddings_free_only():
+    c = _load_cascade()
+    saved = c.PROVIDERS
+    try:
+        c.PROVIDERS = [
+            {"name": "embed_free", "model": "gemini-2.5-flash-lite",
+             "embed_model": "gemini-embedding-001", "cost": 0},
+            {"name": "embed_paid", "model": "gpt-4o-mini",
+             "embed_model": "text-embedding-3-small", "cost": 1},
+        ]
+        off = [p["name"] for p in c._embed_ordered(free_only=False)]
+        assert set(off) == {"embed_free", "embed_paid"}, \
+            f"free-only OFF changed the embedding provider list: {off}"
+        free = [p["name"] for p in c._embed_ordered(free_only=True)]
+        assert free == ["embed_free"], \
+            f"paid embedding provider leaked under free-only: {free}"
+    finally:
+        c.PROVIDERS = saved
+
+
 # ── Direct function registration ─────────────────────────────────────────────
 # Register each test function
 
@@ -631,6 +848,14 @@ if __name__ == "__main__":
         ]),
         ("Metrics", [
             test_metrics,
+        ]),
+        ("Free-Only Mode (unit)", [
+            test_free_only_on_excludes_paid,
+            test_free_only_fails_closed,
+            test_failed_provider_not_retried,
+            test_free_only_off_unchanged,
+            test_model_is_free_gate,
+            test_embeddings_free_only,
         ]),
     ]
 
