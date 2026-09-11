@@ -216,6 +216,63 @@ def _estimate_cost(prompt_tokens: int, completion_tokens: int, model: str) -> fl
             return (prompt_tokens / 1_000_000 * inp) + (completion_tokens / 1_000_000 * out)
     return 0.0
 
+
+# ── Free-only mode (opt-in, request-scoped) ──────────────────────────────────
+# Unattended traffic (cron, gateway, compression) must never silently spend
+# money. A caller opts in for a SINGLE request via either:
+#   (a) header  X-Cascade-Free-Only: true
+#   (b) model   "cascade-free"  (alias for the normal default model)
+# Both are request-scoped — the default (neither present) behaves exactly as
+# before and remains paid-capable. When enabled, every provider/model candidate
+# is filtered to genuinely free ones (provider cost == 0 AND, when the model is
+# priced, a (0.0, 0.0) entry). If nothing free can serve, we return a clear
+# error rather than falling through to a paid provider.
+FREE_ONLY_HEADER  = "X-Cascade-Free-Only"
+FREE_ONLY_ALIAS   = "cascade-free"
+_FREE_ONLY_TRUE   = {"1", "true", "yes", "on", "y"}
+
+
+def _model_is_free(model: str) -> bool:
+    """True if the model is priced at zero (or unpriced → free-safe default).
+
+    The pricing table treats a missing entry as $0 (free-tier safe default, see
+    KNOWN_MODEL_COSTS docstring), so an unpriced model counts as free. A model
+    with any non-zero input/output price is paid.
+    """
+    if not model:
+        return True
+    if model in KNOWN_MODEL_COSTS:
+        inp, out = KNOWN_MODEL_COSTS[model]
+        return inp == 0.0 and out == 0.0
+    # Longest-prefix match mirrors _estimate_cost's resolution order.
+    for key, (inp, out) in sorted(KNOWN_MODEL_COSTS.items(), key=lambda x: -len(x[0])):
+        if key in model:
+            return inp == 0.0 and out == 0.0
+    return True   # unpriced → free-safe default
+
+
+def _provider_is_free(provider: dict) -> bool:
+    """True only if the provider is free by BOTH signals we trust.
+
+    Requires cost == 0 (the explicit tier flag) AND a free model price. Using
+    both means a mislabelled provider can't leak through on one weak signal:
+    cost==0 alone would pass a paid model pinned under a free-cost provider,
+    and a (0,0) price alone would pass a provider whose cost tier says paid.
+    """
+    if provider.get("cost", 1) != 0:
+        return False
+    return _model_is_free(provider.get("model", ""))
+
+
+def _free_only_requested(payload: dict) -> bool:
+    """Request-scoped free-only opt-in: header OR model alias. No state kept."""
+    hdr = (request.headers.get(FREE_ONLY_HEADER, "") or "").strip().lower()
+    if hdr in _FREE_ONLY_TRUE:
+        return True
+    model = (payload.get("model") or "").strip().lower()
+    return model == FREE_ONLY_ALIAS
+
+
 # ── Bulkheads ───────────────────────────────────────────────────────────────
 # Max concurrent in-flight requests per provider. Prevents one slow provider
 # from consuming all worker threads. 0 = unlimited (default 4).
@@ -2328,6 +2385,18 @@ def _route_completion(payload: dict, streaming: bool):
     messages = payload.get("messages", [])
     trace_id = _uuid.uuid4().hex[:12]
 
+    # ── Free-only (opt-in, request-scoped) ──────────────────────────────────
+    # Resolved once here from the request header or the "cascade-free" model
+    # alias. Normalise the alias to the normal default model so the rest of the
+    # pipeline (pinning, ordering) sees a model it recognises — the alias is a
+    # routing hint, not a real upstream model id.
+    free_only = _free_only_requested(payload)
+    if (payload.get("model") or "").strip().lower() == FREE_ONLY_ALIAS:
+        payload = dict(payload)
+        payload["model"] = CASCADE_MODEL
+    if free_only:
+        log.info("[%s] ≋ FREE-ONLY mode enabled — paid providers/models excluded", trace_id)
+
     # Cache check (non-streaming only)
     if not streaming:
         cached = cache.get(payload)
@@ -2376,6 +2445,17 @@ def _route_completion(payload: dict, streaming: bool):
     # soft rules degrade the same way. A documented degradation beats a
     # hard "All providers exhausted".
     _prompt_model, _prompt_strict = _pick_model_by_prompt(messages)
+    if free_only and _prompt_model:
+        # A keyword rule can map to a paid model (e.g. the "complex" rule →
+        # anthropic/claude-sonnet-5). Under free-only that pin is rejected
+        # outright — we do NOT downgrade to the free cascade *silently*; we fall
+        # through to the normal (now free-filtered) candidate ordering below,
+        # which selects only free providers.
+        if not _model_is_free(_prompt_model):
+            log.info(
+                "[%s] ≋ free-only: ignoring prompt-route pin model=%s (paid) — "
+                "using free candidate cascade", trace_id, _prompt_model)
+            _prompt_model = None
     if _prompt_model:
         _pinned_served = any(
             p.get("model") == _prompt_model and
@@ -2394,6 +2474,27 @@ def _route_completion(payload: dict, streaming: bool):
                 trace_id, _prompt_model, _prompt_strict)
 
     ordered    = _ordered_providers(payload)
+
+    # FREE-ONLY hard filter: drop every candidate that isn't genuinely free,
+    # applied AFTER ordering so it also strips the model-pin path (a request
+    # pinned to a paid model has no free provider and ends up empty → clear
+    # error below, never a silent paid fall-through).
+    if free_only:
+        free_ordered = [p for p in ordered if _provider_is_free(p)]
+        if len(free_ordered) < len(ordered):
+            log.info("[%s] ≋ free-only: excluded %d paid provider(s): %s",
+                     trace_id, len(ordered) - len(free_ordered),
+                     [p["name"] for p in ordered if not _provider_is_free(p)])
+        ordered = free_ordered
+        if not ordered:
+            log.error("[%s] ≋ free-only: no free provider can serve this request", trace_id)
+            return ("error", {"error": {
+                "message": ("Free-only mode is enabled (X-Cascade-Free-Only or model "
+                            "'cascade-free') but no free provider can serve this request. "
+                            "Paid providers are excluded by request. Remove the opt-in to "
+                            "allow paid providers."),
+                "type": "router_error",
+                "code": "free_only_no_provider"}}, 503)
 
     # Filter providers whose startup probe returned unavailable (e.g. auth
     # failures, model-id mismatches). This avoids wasting a round-trip on
