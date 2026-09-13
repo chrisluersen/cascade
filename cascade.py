@@ -81,6 +81,7 @@ _HTTP.mount("https://", _http_adapter)
 _HTTP.mount("http://", _http_adapter)
 
 PORT              = int(os.environ.get("PORT", 8319))
+BIND_HOST         = os.environ.get("CASCADE_BIND_HOST", "127.0.0.1")  # loopback by default; was hardcoded 0.0.0.0 on both serve paths
 CASCADE_API_KEY    = [k.strip() for k in os.environ.get("CASCADE_API_KEY", "").split(",") if k.strip()]
 CASCADE_MODEL      = os.environ.get("CASCADE_MODEL_ID", "cascade")
 CACHE_TTL         = int(os.environ.get("CACHE_TTL_SECONDS", 600))   # 0 = disabled
@@ -3005,7 +3006,7 @@ if __name__ == "__main__":
     try:
         from waitress import serve
         log.info("Serving with waitress (production WSGI)")
-        serve(app, host="0.0.0.0", port=PORT, threads=int(os.environ.get("WORKER_THREADS", 16)))
+        serve(app, host=BIND_HOST, port=PORT, threads=int(os.environ.get("WORKER_THREADS", 16)))
     except ImportError:
         log.warning("waitress not installed — falling back to Flask dev server")
-        app.run(host="0.0.0.0", port=PORT, threaded=True)
+        app.run(host=BIND_HOST, port=PORT, threaded=True)
