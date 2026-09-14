@@ -27,6 +27,7 @@ Quick start:
 
 import json
 import os
+import datetime as _dt
 import time
 import threading
 import logging
@@ -231,6 +232,42 @@ def _estimate_cost(prompt_tokens: int, completion_tokens: int, model: str) -> fl
 FREE_ONLY_HEADER  = "X-Cascade-Free-Only"
 FREE_ONLY_ALIAS   = "cascade-free"
 _FREE_ONLY_TRUE   = {"1", "true", "yes", "on", "y"}
+
+
+
+# ── Route log ───────────────────────────────────────────────────────────────
+# One JSON line per NON-DEFAULT route -- i.e. every request this router serves,
+# since serving here at all is the departure from the default (nous) path. This
+# is the instrument that makes "cost per ACCEPTED task" measurable, which is what
+# the delegation-tier promotion trigger depends on; without it the trigger can
+# never fire and the tier decision stays unfalsifiable.
+#
+# Deliberately records only what the ROUTER can know. `reason`, `risk` and
+# `verification` from the design's field list are agent-side judgements a router
+# cannot observe; writing them here as nulls would be a fake instrument. They are
+# the other half of the log, written by the agent when it escalates on purpose.
+#
+# Never raises: a logging failure must not break routing.
+ROUTE_LOG_PATH = os.environ.get(
+    "CASCADE_ROUTE_LOG",
+    str(Path(os.environ.get("HERMES_HOME", str(Path.home() / "AppData/Local/hermes")))
+        / "Artifacts" / "cascade-routes.jsonl"),
+)
+
+
+def _route_log(**fields) -> None:
+    """Append one routing-decision record. Best-effort by design."""
+    try:
+        rec = {"ts": _dt.datetime.now().astimezone().isoformat(timespec="seconds")}
+        rec.update({k: v for k, v in fields.items() if v is not None})
+        with open(ROUTE_LOG_PATH, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, default=str) + "\n")
+    except Exception as exc:  # noqa: BLE001 -- logging must never break routing
+        # LOUD. A silent failure here is indistinguishable from "no traffic" -- this
+        # exact clause hid a NameError (an undefined module alias) so the file simply
+        # never appeared, which read as "the router saw nothing".
+        log.warning("ROUTE LOG FAILED (%s: %s) -> %s", type(exc).__name__, exc,
+                    ROUTE_LOG_PATH)
 
 
 def _model_is_free(model: str) -> bool:
@@ -2432,6 +2469,8 @@ def _route_completion(payload: dict, streaming: bool):
     # pipeline (pinning, ordering) sees a model it recognises — the alias is a
     # routing hint, not a real upstream model id.
     free_only = _free_only_requested(payload)
+    _alias_used = (payload.get("model") or "").strip().lower() == FREE_ONLY_ALIAS
+    _route = "cascade-free-alias" if _alias_used else ("free-only-header" if free_only else "direct")
     if (payload.get("model") or "").strip().lower() == FREE_ONLY_ALIAS:
         payload = dict(payload)
         payload["model"] = CASCADE_MODEL
@@ -2443,6 +2482,8 @@ def _route_completion(payload: dict, streaming: bool):
         cached = cache.get(payload)
         if cached is not None:
             log.info("[%s] ↩ cache hit", trace_id)
+            _route_log(trace_id=trace_id, route=_route, outcome="cache",
+                       model=(payload.get("model") or ""), provider="cache", free_only=free_only)
             return ("json", cached, trace_id)
 
     est_tokens = _estimated_tokens(messages)
@@ -2678,6 +2719,10 @@ def _route_completion(payload: dict, streaming: bool):
                 if streaming:
                     gen = (_anthropic_streaming_generator(resp) if is_anthropic
                            else _streaming_generator(resp))
+                    _route_log(trace_id=trace_id, route=_route, outcome="ok",
+                               model=provider.get("model", ""), provider=name,
+                               free_only=free_only, streaming=True,
+                               latency_ms=round(elapsed * 1000))
                     return ("stream", gen, name, trace_id)
                 else:
                     data = (_from_anthropic_response(_replace_surrogates(resp.json())) if is_anthropic
@@ -2693,12 +2738,20 @@ def _route_completion(payload: dict, streaming: bool):
                         log.info("[%s]   $ cost=%.6f (%d+%d tok)", trace_id, cost, prompt_tok, completion_tok)
                         stats.record_cost(name, cost, prompt_tok, completion_tok)
                     cache.set(payload, data)
+                    _route_log(trace_id=trace_id, route=_route, outcome="ok",
+                               model=provider.get("model", ""), provider=name,
+                               free_only=free_only, streaming=False,
+                               latency_ms=round(elapsed * 1000), cost_usd=cost,
+                               prompt_tokens=prompt_tok, completion_tokens=completion_tok)
                     return ("json", data, trace_id)
 
             log.info("[%s] → %s done — trying next provider", trace_id, name)
         finally:
             bulkhead.release(name)
 
+    _route_log(trace_id=trace_id, route=_route, outcome="error",
+               model=(payload.get("model") or ""), provider="", free_only=free_only,
+               error="all_providers_exhausted")
     return ("error", {"error": {"message": "All providers exhausted", "type": "router_error"}}, 503)
 
 
