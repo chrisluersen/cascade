@@ -13,6 +13,7 @@ Usage:
 Requirements: cascade must be running on localhost:8319
 """
 
+import functools
 import json
 import os
 import sys
@@ -23,7 +24,36 @@ import urllib.request
 # ── Test configuration ──────────────────────────────────────────────────────
 
 BASE = os.environ.get("CASCADE_BASE", "http://127.0.0.1:8319")
-AUTH_KEY = os.environ.get("CASCADE_AUTH_KEY", "sk-router-1")
+
+
+def _resolve_auth_key() -> str:
+    """Resolve the router key the way cascade-probe.py does: env -> Hermes .env.
+
+    Preferring CASCADE_API_KEY is load-bearing, not cosmetic. This file used to
+    read ONLY `CASCADE_AUTH_KEY` (default "sk-router-1"), while the probe, the
+    watchdog and the host environment all use `CASCADE_API_KEY`. Every test
+    therefore sent a stale default and the suite produced 23 failures that were
+    all the same 401 -- invisible for as long as the @test wrapper swallowed
+    AssertionError (see the decorator's comment below).
+    """
+    for var in ("CASCADE_API_KEY", "CASCADE_AUTH_KEY"):
+        val = (os.environ.get(var) or "").strip()
+        if val:
+            return val
+    env_file = os.path.join(
+        os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "hermes", ".env"
+    )
+    try:
+        with open(env_file, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if line.startswith("CASCADE_API_KEY="):
+                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return "sk-router-1"
+
+
+AUTH_KEY = _resolve_auth_key()
 BAD_KEY = "sk-invalid-test-key-12345"
 
 HEADERS = {
@@ -89,23 +119,46 @@ def _health() -> int:
 
 # ── Test framework ───────────────────────────────────────────────────────────
 
+# pytest collects any module attribute named `test*`. That collides with two
+# things in this file, and both halves of the collision had a real cost:
+#
+#   * `test` itself is the decorator FACTORY, not a test, so pytest tried to
+#     call it and reported `ERROR test_cascade.py::test -- fixture 'name' not
+#     found` on every run.
+#   * every decorated function is the inner `wrapper`, which CATCHES
+#     AssertionError and increments FAIL instead of raising. pytest therefore
+#     inherited a suite that COULD NOT FAIL: injecting an unconditional
+#     `assert False` into a test still produced "33 passed"
+#     (proven by scratch/falsify-pytest-teeth.py, before/after).
+#
+# Fix: hide the factory from collection, and let a failure actually raise when
+# the run is pytest's. The hand-rolled runner below still tallies every failure
+# in one pass -- that is what the PASS/FAIL counters and their summary are for,
+# and its behaviour is unchanged.
+_UNDER_PYTEST = "pytest" in sys.modules
+
+
 def test(name: str):
     """Decorator for test functions. Handles pass/fail counting."""
     def decorator(fn):
+        @functools.wraps(fn)
         def wrapper(*args, **kwargs):
             global PASS, FAIL
             try:
                 fn(*args, **kwargs)
-                print(f"  ✓ {name}")
                 PASS += 1
-            except AssertionError as e:
-                print(f"  ✗ {name}: {e}")
-                FAIL += 1
+                if not _UNDER_PYTEST:
+                    print(f"  ✓ {name}")
             except Exception as e:
-                print(f"  ✗ {name}: {e}")
                 FAIL += 1
+                if _UNDER_PYTEST:
+                    raise  # a pytest run must be ABLE to fail
+                print(f"  ✗ {name}: {e}")
         return wrapper
     return decorator
+
+
+test.__test__ = False  # a decorator factory, not a test — do not collect it
 
 
 # ── Health tests ─────────────────────────────────────────────────────────────
