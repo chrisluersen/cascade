@@ -260,6 +260,11 @@ def _route_log(**fields) -> None:
     try:
         rec = {"ts": _dt.datetime.now().astimezone().isoformat(timespec="seconds")}
         rec.update({k: v for k, v in fields.items() if v is not None})
+        # cost_usd == 0.0 is ambiguous: "free" or "no pricing entry". Derive the
+        # answer here rather than at four call sites, so every record -- present
+        # and future -- carries it.
+        if "model" in rec:
+            rec["priced"] = _model_is_priced(str(rec["model"]))
         with open(ROUTE_LOG_PATH, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(rec, default=str) + "\n")
     except Exception as exc:  # noqa: BLE001 -- logging must never break routing
@@ -289,6 +294,22 @@ def _model_is_free(model: str) -> bool:
         if key in model:
             return inp == 0.0 and out == 0.0
     return False   # unpriced → NOT free (deny; an unpriced paid model must not leak)
+
+
+def _model_is_priced(model: str) -> bool:
+    """True when the model resolves to a KNOWN_MODEL_COSTS entry.
+
+    Route-log disambiguator. `_estimate_cost` returns 0.0 both for a model that
+    is genuinely free and for one with no pricing entry, so a bare
+    `cost_usd: 0.0` cannot be read as either. This says which it was.
+    Resolution order mirrors _estimate_cost / _model_is_free: exact, then
+    longest-prefix substring.
+    """
+    if not model:
+        return False
+    if model in KNOWN_MODEL_COSTS:
+        return True
+    return any(key in model for key in KNOWN_MODEL_COSTS)
 
 
 def _provider_is_free(provider: dict, model_key: str = "model") -> bool:
