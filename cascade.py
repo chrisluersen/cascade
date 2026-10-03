@@ -44,8 +44,14 @@ import requests
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
+OFFLINE = os.environ.get("CASCADE_OFFLINE", "").strip().lower() in {
+    "1", "true", "yes", "on"
+}
+
 def _load_env(path: str = ".env"):
     """Load key=value pairs from a .env file into os.environ (no-op if missing)."""
+    if OFFLINE:
+        return
     p = Path(path)
     if not p.exists():
         return
@@ -358,6 +364,8 @@ def _load_auth_json() -> dict[str, list[str]]:
 
     Returns {provider_name: [keys]}. A missing or invalid file is non-fatal —
     cascade simply falls back to keys from .env (see _keys_for)."""
+    if OFFLINE:
+        return {}
     if not AUTH_FILE.exists():
         return {}
     try:
@@ -449,7 +457,7 @@ def _load_bitwarden_keys() -> dict[str, str]:
         return {}
 
 
-_BW_KEYS = _load_bitwarden_keys()
+_BW_KEYS = {} if OFFLINE else _load_bitwarden_keys()
 
 
 # ── Bitwarden env var name aliases ─────────────────────────────────────────────
@@ -1174,7 +1182,7 @@ def _build_providers() -> list[dict]:
     return providers
 
 
-PROVIDERS = _build_providers()
+PROVIDERS = [] if OFFLINE else _build_providers()
 
 # Providers whose /models endpoint mixes paid models in with the free ones.
 # When auto-discovering a replacement model for these, restrict to :free ids so
@@ -1569,7 +1577,10 @@ class BulkheadManager:
 bulkhead = BulkheadManager(PROVIDERS, BULKHEAD_MAX)
 
 # Background: validate providers, fix models, assign ratings
-threading.Thread(target=_initialize_ratings, args=(PROVIDERS, pool), daemon=True).start()
+if not OFFLINE:
+    threading.Thread(
+        target=_initialize_ratings, args=(PROVIDERS, pool), daemon=True
+    ).start()
 
 # ── Per-provider stats ─────────────────────────────────────────────────────────
 
@@ -2193,6 +2204,8 @@ _ENCODER = "uninitialized"  # sentinel; resolves to an encoder or None on first 
 
 def _get_encoder():
     global _ENCODER
+    if OFFLINE:
+        return None
     if _ENCODER == "uninitialized":
         try:
             import tiktoken
