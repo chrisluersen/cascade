@@ -2299,7 +2299,7 @@ def _ordered_providers(payload: dict, free_only: bool = False) -> list[dict]:
 
 # ── Request forwarding ─────────────────────────────────────────────────────────
 
-def forward(provider: dict, key: str, payload: dict, streaming: bool) -> requests.Response | None:
+def forward(provider: dict, key: str, payload: dict, streaming: bool) -> tuple[requests.Response | None, bool]:
     # Anthropic uses a different wire format — translate and send directly.
     if provider.get("protocol") == "anthropic":
         model = payload.get("model", "")
@@ -2313,11 +2313,12 @@ def forward(provider: dict, key: str, payload: dict, streaming: bool) -> request
         body = _to_anthropic_body({**payload, "messages": cleaned}, model)
         hdrs = {"x-api-key": key, "anthropic-version": "2023-06-01", "Content-Type": "application/json"}
         try:
-            return _HTTP.post("https://api.anthropic.com/v1/messages",
-                              headers=hdrs, json=body, stream=streaming, timeout=(10, 120))
+            response = _HTTP.post("https://api.anthropic.com/v1/messages",
+                                  headers=hdrs, json=body, stream=streaming, timeout=(10, 120))
+            return response, False
         except requests.exceptions.RequestException as e:
             log.error(f"  Network error → anthropic: {e}")
-            return None
+            return None, False
 
     # Sanitize header values — HTTP headers must be latin-1 encodable.
     # Some corrupted keys (e.g. placeholder redaction text) contain
