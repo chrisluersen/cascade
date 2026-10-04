@@ -36,6 +36,7 @@ import itertools
 import uuid as _uuid
 import subprocess
 import shutil
+from copy import deepcopy
 from pathlib import Path
 from collections import deque
 from flask import Flask, request, jsonify, Response, stream_with_context
@@ -2427,6 +2428,14 @@ def models():
     ]})
 
 
+def _cache_identity(payload: dict, endpoint: str, free_only: bool) -> dict:
+    return {
+        "endpoint": endpoint,
+        "free_only": free_only,
+        "payload": deepcopy(payload),
+    }
+
+
 def _route_completion(payload: dict, streaming: bool):
     """Core routing + failover pipeline, shared by /v1/chat/completions and the
     Anthropic-compatible /v1/messages. Takes an OpenAI-format payload and returns
@@ -2450,12 +2459,13 @@ def _route_completion(payload: dict, streaming: bool):
     if (payload.get("model") or "").strip().lower() == FREE_ONLY_ALIAS:
         payload = dict(payload)
         payload["model"] = CASCADE_MODEL
+    cache_identity = _cache_identity(payload, "chat", free_only)
     if free_only:
         log.info("[%s] ≋ FREE-ONLY mode enabled — paid providers/models excluded", trace_id)
 
     # Cache check (non-streaming only)
     if not streaming:
-        cached = cache.get(payload)
+        cached = cache.get(cache_identity)
         if cached is not None:
             log.info("[%s] ↩ cache hit", trace_id)
             _route_log(trace_id=trace_id, route=_route, outcome="cache",
@@ -2713,7 +2723,7 @@ def _route_completion(payload: dict, streaming: bool):
                     if cost > 0:
                         log.info("[%s]   $ cost=%.6f (%d+%d tok)", trace_id, cost, prompt_tok, completion_tok)
                         stats.record_cost(name, cost, prompt_tok, completion_tok)
-                    cache.set(payload, data)
+                    cache.set(cache_identity, data)
                     _route_log(trace_id=trace_id, route=_route, outcome="ok",
                                model=provider.get("model", ""), provider=name,
                                free_only=free_only, streaming=False,
@@ -2795,6 +2805,7 @@ def embeddings():
     # Free-only opt-in is request-scoped here too: /v1/embeddings must honour
     # X-Cascade-Free-Only / the cascade-free alias, or it becomes a paid leak.
     free_only = _free_only_requested(payload)
+    cache_identity = _cache_identity(payload, "embeddings", free_only)
     ordered = _embed_ordered(free_only=free_only)
     if not ordered:
         if free_only:
@@ -2810,7 +2821,7 @@ def embeddings():
                                   "type": "router_error"}}), 503
 
     # Embeddings are deterministic — identical input is a perfect cache hit.
-    cached = cache.get(payload)
+    cached = cache.get(cache_identity)
     if cached is not None:
         log.info("↩ cache hit (embeddings)")
         return jsonify(cached)
@@ -2870,7 +2881,7 @@ def embeddings():
             stats.record_success(name, elapsed); stats.record_health(name, True)
             log.info(f"  ✓ {name} embeddings ({elapsed*1000:.0f}ms)")
             data = resp.json()
-            cache.set(payload, data)
+            cache.set(cache_identity, data)
             return jsonify(data), 200
 
         log.warning(f"✗ {name} embeddings exhausted — cascading")
