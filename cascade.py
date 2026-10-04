@@ -2153,11 +2153,8 @@ def _estimated_tokens(messages: list) -> int:
 
 
 def _supports_tools(provider: dict) -> bool:
-    """Whether this provider's model handles function calling, from the startup
-    probe. Unknown (e.g. state from before this feature, or never probed) is
-    treated optimistically as capable so we never hard-fail on missing data."""
-    val = _provider_state.get(provider["name"], {}).get("supports_tools")
-    return True if val is None else bool(val)
+    """Only explicit successful capability evidence permits tool routing."""
+    return _provider_state.get(provider["name"], {}).get("supports_tools") is True
 
 
 def _ordered_providers(payload: dict, free_only: bool = False) -> list[dict]:
@@ -2542,13 +2539,17 @@ def _route_completion(payload: dict, streaming: bool):
 
     log.info("[%s] → ordered=%s", trace_id, [p["name"] for p in ordered])
 
-    # Tool-aware routing: when the request carries tools, prefer providers whose
-    # model actually supports function calling — otherwise a provider that
-    # silently ignores tools would return plain text instead of the tool call.
-    # SAFETY — only enforce this when at least one tool-capable provider is
-    # available; if none are, fall through to all of them rather than hard-fail.
-    needs_tools  = bool(payload.get("tools"))
-    enforce_tool = needs_tools and any(_supports_tools(p) for p in ordered)
+    # Tool requests must never fall through to unverified providers.
+    needs_tools = bool(payload.get("tools"))
+    if needs_tools:
+        ordered = [p for p in ordered if _supports_tools(p)]
+        if not ordered:
+            return ("error", {"error": {
+                "message": "No provider has verified tool support for this request",
+                "type": "router_error",
+                "code": "tool_capability_unavailable",
+            }}, 503)
+    enforce_tool = needs_tools
 
     # Circuit breaker: skip providers whose breaker is open. SAFETY — if EVERY
     # candidate is open, treat them all as half-open probes (skip none) so we
