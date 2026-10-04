@@ -148,9 +148,9 @@ STATE_TTL_HOURS   = int(os.environ.get("CASCADE_STATE_TTL_HOURS", 24))  # 0 = re
 AUTH_FILE         = Path(os.environ.get("CASCADE_AUTH_FILE", "./auth.json"))  # cascade's own key store
 
 # ── Cost tracking (USD per 1M tokens) ──────────────────────────────────────
-# Input/output pricing for every model cascade routes through. Missing entries
-# fall back to $0 (free-tier safe default). Sourced from provider pricing pages
-# and OpenRouter pricing (2026-07).
+# Model-only input/output price estimates. Missing entries estimate $0 but are
+# unpriced, not known free. Entries may depend on provider/account billing tier;
+# this table does not certify free-only billing guarantees.
 # Usage is tracked per-provider and exposed at /v1/status + /metrics.
 KNOWN_MODEL_COSTS: dict = {
     # Google — all free tier
@@ -208,22 +208,16 @@ KNOWN_MODEL_COSTS: dict = {
     "qwen3.5:9b-16k":               (0.0,    0.0),      # ollama local
     }
 
+def _model_price(model: str) -> tuple[float, float] | None:
+    return KNOWN_MODEL_COSTS.get(model)
+
 def _estimate_cost(prompt_tokens: int, completion_tokens: int, model: str) -> float:
-    """Estimate USD cost for a request. Matches full model ID first, then falls
-    back to longest-prefix match for generic entries like 'gpt-4o'. Returns 0
-    for unknown/free models."""
-    if not prompt_tokens and not completion_tokens:
+    """Legacy numeric estimate; use _model_is_priced to distinguish unknown."""
+    price = _model_price(model)
+    if price is None:
         return 0.0
-    # Exact match first
-    cost = KNOWN_MODEL_COSTS.get(model)
-    if cost:
-        inp, out = cost
-        return (prompt_tokens / 1_000_000 * inp) + (completion_tokens / 1_000_000 * out)
-    # Longest-prefix substring match for generic entries
-    for key, (inp, out) in sorted(KNOWN_MODEL_COSTS.items(), key=lambda x: -len(x[0])):
-        if key in model:
-            return (prompt_tokens / 1_000_000 * inp) + (completion_tokens / 1_000_000 * out)
-    return 0.0
+    inp, out = price
+    return (prompt_tokens * inp + completion_tokens * out) / 1_000_000
 
 
 # ── Free-only mode (opt-in, request-scoped) ──────────────────────────────────
@@ -283,40 +277,13 @@ def _route_log(**fields) -> None:
 
 
 def _model_is_free(model: str) -> bool:
-    """True only if the model is EXPLICITLY priced at zero in the table.
-
-    Deny-by-default: a model with no pricing-table entry is treated as PAID,
-    not free. The original "unpriced → free-safe default" was a leak — an
-    unpriced paid model counted as free and passed the free-only gate. An
-    unknown model is exactly the case this gate must fail closed on, so both
-    the empty-model case and the no-entry case return False.
-    """
-    if not model:
-        return False
-    if model in KNOWN_MODEL_COSTS:
-        inp, out = KNOWN_MODEL_COSTS[model]
-        return inp == 0.0 and out == 0.0
-    # Longest-prefix match mirrors _estimate_cost's resolution order.
-    for key, (inp, out) in sorted(KNOWN_MODEL_COSTS.items(), key=lambda x: -len(x[0])):
-        if key in model:
-            return inp == 0.0 and out == 0.0
-    return False   # unpriced → NOT free (deny; an unpriced paid model must not leak)
+    """True only for an exact model ID explicitly priced at zero."""
+    return _model_price(model) == (0.0, 0.0)
 
 
 def _model_is_priced(model: str) -> bool:
-    """True when the model resolves to a KNOWN_MODEL_COSTS entry.
-
-    Route-log disambiguator. `_estimate_cost` returns 0.0 both for a model that
-    is genuinely free and for one with no pricing entry, so a bare
-    `cost_usd: 0.0` cannot be read as either. This says which it was.
-    Resolution order mirrors _estimate_cost / _model_is_free: exact, then
-    longest-prefix substring.
-    """
-    if not model:
-        return False
-    if model in KNOWN_MODEL_COSTS:
-        return True
-    return any(key in model for key in KNOWN_MODEL_COSTS)
+    """Disambiguate exact priced models from unknown zero-cost estimates."""
+    return _model_price(model) is not None
 
 
 def _provider_is_free(provider: dict, model_key: str = "model") -> bool:
