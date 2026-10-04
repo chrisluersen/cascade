@@ -436,6 +436,14 @@ _BW_ENV_ALIASES: dict[str, str] = {
     "NVIDIA_NIM_API_KEY":    "NVIDIA_API_KEY",       # BW has NVIDIA_API_KEY
     "SAMBANOVA_DIRECT_API_KEY": "SAMBANOVA_API_KEY", # BW has SAMBANOVA_API_KEY
     "GLM_API_KEYS":          "ZAI_API_KEY",          # BW has ZAI_API_KEY
+    # Singular->plural mappings (BW stores singular, cascade expects plural)
+    "GROQ_API_KEYS":         "GROQ_API_KEY",         # BW has GROQ_API_KEY
+    "FIREWORKS_API_KEYS":    "FIREWORKS_API_KEY",    # BW has FIREWORKS_API_KEY
+    "DEEPINFRA_API_KEYS":    "DEEPINFRA_API_KEY",    # BW has DEEPINFRA_API_KEY
+    "MISTRAL_API_KEYS":      "MISTRAL_API_KEY",      # BW has MISTRAL_API_KEY
+    "SAMBANOVA_API_KEYS":    "SAMBANOVA_API_KEY",    # BW has SAMBANOVA_API_KEY
+    "CEREBRAS_API_KEYS":     "CEREBRAS_API_KEY",     # BW has CEREBRAS_API_KEY
+    "NAGA_API_KEYS":         "NAGA_API_KEY",         # BW has NAGA_API_KEY
 }
 # Circuit-breaker knobs — a provider that fails health repeatedly is tripped out
 # of rotation for a cooldown, then probed again (half-open). Overridable via env.
