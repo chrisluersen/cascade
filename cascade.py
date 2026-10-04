@@ -144,7 +144,7 @@ def _pick_model_by_prompt(messages: list) -> tuple[str | None, bool]:
 
 FAST_ROUTE_TOKENS = int(os.environ.get("FAST_ROUTE_THRESHOLD", 200)) # 0 = disabled, 50-200 recommended
 STATE_FILE        = Path(os.environ.get("CASCADE_STATE_FILE", "./cascade_state.json"))
-STATE_TTL_HOURS   = int(os.environ.get("CASCADE_STATE_TTL_HOURS", 24))  # 0 = re-probe every start
+STATE_TTL_HOURS   = int(os.environ.get("CASCADE_STATE_TTL_HOURS", 4))   # 0 = re-probe every start
 AUTH_FILE         = Path(os.environ.get("CASCADE_AUTH_FILE", "./auth.json"))  # cascade's own key store
 
 # ── Cost tracking (USD per 1M tokens) ──────────────────────────────────────
@@ -163,7 +163,8 @@ KNOWN_MODEL_COSTS: dict = {
     "gpt-4o-mini":                  (0.0,    0.0),      # free via GitHub Models
 
     # Groq — free tier
-    "llama-3.3-70b-versatile":      (0.0,    0.0),
+    "llama-3.3-70b-versatile":      (0.0,    0.0),      # retired 2026-10; kept for old state files
+    "openai/gpt-oss-120b":          (0.0,    0.0),      # groq + huggingface free
 
     # Direct free providers
     "gpt-oss-120b":                 (0.0,    0.0),      # ovhcloud, cerebras free
@@ -444,6 +445,7 @@ _BW_ENV_ALIASES: dict[str, str] = {
     "SAMBANOVA_API_KEYS":    "SAMBANOVA_API_KEY",    # BW has SAMBANOVA_API_KEY
     "CEREBRAS_API_KEYS":     "CEREBRAS_API_KEY",     # BW has CEREBRAS_API_KEY
     "NAGA_API_KEYS":         "NAGA_API_KEY",         # BW has NAGA_API_KEY
+    "HUGGINGFACE_API_KEYS":  "HF_TOKEN",             # BW has HF_TOKEN (the plural secret is stale)
 }
 # Circuit-breaker knobs — a provider that fails health repeatedly is tripped out
 # of rotation for a cooldown, then probed again (half-open). Overridable via env.
@@ -453,7 +455,7 @@ BREAKER_ERROR_RATE  = float(os.environ.get("BREAKER_ERROR_RATE", 0.5))  # trip a
 BREAKER_COOLDOWN    = int(os.environ.get("BREAKER_COOLDOWN", 60))       # seconds the breaker stays open
 
 # Providers known for low-latency inference — promoted for short requests
-_FAST_PROVIDERS = {"groq", "zai", "github_models", "gemini",
+_FAST_PROVIDERS = {"groq", "zai", "gemini",
                      "sambanova_direct", "nvidia_nim", "naga",
                      "openai", "deepseek-v4-flash",
                      "ovhcloud", "aion", "deepinfra", "together"}
@@ -584,20 +586,20 @@ def _keys_for(provider_name: str, env_var: str) -> list[str]:
     """
     merged = list(_AUTH_KEYS.get(provider_name, []))
 
-    # Bitwarden: resolve the env var name through multiple strategies
-    bw_val = _BW_KEYS.get(env_var, "")
-    if not bw_val:
-        # Try singular form (strip trailing S)
-        singular = env_var[:-1] if env_var.endswith("S") else None
-        if singular and singular != env_var:
-            bw_val = _BW_KEYS.get(singular, "")
-    if not bw_val:
-        # Try global alias table (maps cascade env_var names to BW key names)
-        aliased = _BW_ENV_ALIASES.get(env_var, "")
-        if aliased:
-            bw_val = _BW_KEYS.get(aliased, "")
-    if bw_val:
-        merged.append(bw_val)
+    # Bitwarden: gather a value from EVERY strategy (exact, singular, alias) rather
+    # than stopping at the first that matches. A stale secret whose name exactly
+    # matches the plural env var (e.g. GROQ_API_KEYS) must not shadow the good
+    # singular key (GROQ_API_KEY) — both are returned and the pool rotates.
+    candidates = [env_var]
+    if env_var.endswith("S"):
+        candidates.append(env_var[:-1])
+    alias = _BW_ENV_ALIASES.get(env_var)
+    if alias:
+        candidates.append(alias)
+    for cand in candidates:
+        v = _BW_KEYS.get(cand, "")
+        if v:
+            merged.append(v)
     merged += _keys(env_var)
     seen, out = set(), []
     for k in merged:
@@ -635,53 +637,8 @@ def _build_providers() -> list[dict]:
     # Tier 1 — Fast & Free (handles ~90%+ of requests)
     # ════════════════════════════════════════════════════════════
 
-    # --- cohere (command-a-03-2025 via OpenRouter) ---
-    if openrouter_keys:
-        providers.append({
-            "name":     "cohere",
-            "base_url": "https://openrouter.ai/api/v1",
-            "model":    "cohere/command-a-03-2025",
-            "keys":     openrouter_keys,
-            "cost":     0,
-            "headers":  {
-                "HTTP-Referer": os.environ.get("OPENROUTER_SITE_URL",
-                    "https://github.com/chrisluersen/cascade"),
-                "X-Title":      os.environ.get("OPENROUTER_APP_NAME",
-                    "cascade"),
-            },
-        })
 
-    # --- cerebras (gpt-oss-120b via OpenRouter) ---
-    if openrouter_keys:
-        providers.append({
-            "name":     "cerebras",
-            "base_url": "https://openrouter.ai/api/v1",
-            "model":    "cerebras/gpt-oss-120b",
-            "keys":     openrouter_keys,
-            "cost":     0,
-            "headers":  {
-                "HTTP-Referer": os.environ.get("OPENROUTER_SITE_URL",
-                    "https://github.com/chrisluersen/cascade"),
-                "X-Title":      os.environ.get("OPENROUTER_APP_NAME",
-                    "cascade"),
-            },
-        })
 
-    # --- nvidia (deepseek-ai/deepseek-v4-flash via OpenRouter) ---
-    if openrouter_keys:
-        providers.append({
-            "name":     "nvidia",
-            "base_url": "https://openrouter.ai/api/v1",
-            "model":    "nvidia/deepseek-ai/deepseek-v4-flash",
-            "keys":     openrouter_keys,
-            "cost":     0,
-            "headers":  {
-                "HTTP-Referer": os.environ.get("OPENROUTER_SITE_URL",
-                    "https://github.com/chrisluersen/cascade"),
-                "X-Title":      os.environ.get("OPENROUTER_APP_NAME",
-                    "cascade"),
-            },
-        })
 
     # --- nvidia_nim (direct NVIDIA NIM API, free dev tier — 100+ models) ---
     nvidia_nim_keys = _keys_for("nvidia", "NVIDIA_NIM_API_KEY")
@@ -698,37 +655,7 @@ def _build_providers() -> list[dict]:
     # Tier 2 — Free Large Context (overflow when fast tiers can't)
     # ════════════════════════════════════════════════════════════
 
-    # --- mistral (mistral-medium-latest via OpenRouter) ---
-    if openrouter_keys:
-        providers.append({
-            "name":     "mistral",
-            "base_url": "https://openrouter.ai/api/v1",
-            "model":    "mistral/mistral-medium-latest",
-            "keys":     openrouter_keys,
-            "cost":     0,
-            "headers":  {
-                "HTTP-Referer": os.environ.get("OPENROUTER_SITE_URL",
-                    "https://github.com/chrisluersen/cascade"),
-                "X-Title":      os.environ.get("OPENROUTER_APP_NAME",
-                    "cascade"),
-            },
-        })
 
-    # --- sambanova (DeepSeek-V3.2 via OpenRouter) ---
-    if openrouter_keys:
-        providers.append({
-            "name":     "sambanova",
-            "base_url": "https://openrouter.ai/api/v1",
-            "model":    "sambanova/DeepSeek-V3.2",
-            "keys":     openrouter_keys,
-            "cost":     0,
-            "headers":  {
-                "HTTP-Referer": os.environ.get("OPENROUTER_SITE_URL",
-                    "https://github.com/chrisluersen/cascade"),
-                "X-Title":      os.environ.get("OPENROUTER_APP_NAME",
-                    "cascade"),
-            },
-        })
 
     # --- sambanova_direct (direct SambaNova API, free tier — 20 RPM, 200K TPD) ---
     sambanova_direct_keys = _keys_for("sambanova", "SAMBANOVA_DIRECT_API_KEY")
@@ -788,20 +715,11 @@ def _build_providers() -> list[dict]:
         providers.append({
             "name":     "groq",
             "base_url": "https://api.groq.com/openai/v1",
-            "model":    os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile"),
+            "model":    os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b"),
             "keys":     groq_keys,
             "cost":     0,
         })
 
-    github_keys = _keys_for("github_models", "GITHUB_MODELS_TOKENS")
-    if github_keys:
-        providers.append({
-            "name":     "github_models",
-            "base_url": "https://models.inference.ai.azure.com",
-            "model":    os.environ.get("GITHUB_MODELS_MODEL", "gpt-4o"),
-            "keys":     github_keys,
-            "cost":     0,
-        })
 
     # ════════════════════════════════════════════════════════════
     # Tier 6 — Rarely hits (last resort / rarely useful)
@@ -1412,10 +1330,12 @@ def _initialize_ratings(providers: list, pool_ref):
             cached_doc = json.loads(STATE_FILE.read_text())
             _provider_state = cached_doc.get("providers", {})
             log.info(f"[ratings] Loaded cached state ({len(_provider_state)} providers)")
+            # Operator escape hatch: re-probe now even while the cached state is fresh.
+            force_reprobe = os.environ.get("CASCADE_FORCE_REPROBE", "").strip().lower() in ("1", "true", "yes")
             # Probes cost a real completion per provider, so skip them while the
             # state is fresh and still covers every configured provider.
             age = time.time() - cached_doc.get("last_updated_ts", 0)
-            if (STATE_TTL_HOURS > 0 and age < STATE_TTL_HOURS * 3600
+            if (not force_reprobe and STATE_TTL_HOURS > 0 and age < STATE_TTL_HOURS * 3600
                     and all(p["name"] in _provider_state for p in providers)):
                 for p in providers:
                     cached_model = _provider_state[p["name"]].get("model")
@@ -2635,9 +2555,22 @@ def _route_completion(payload: dict, streaming: bool):
                     log.warning("[%s]   %s 429 — cooldown %ds, trying next key", trace_id, name, retry_after)
                     continue
 
-                if resp.status_code in (400, 401, 403):
+                if resp.status_code in (401, 403):
                     stats.record_error(name)
-                    # request/auth-specific — NOT a provider health failure,
+                    # Auth-specific to THIS credential. Another key is a different
+                    # credential (same reasoning as 429), so rotate instead of
+                    # aborting: a stale secret must not shadow a good one for the
+                    # same provider. Mark the provider failed only once every key
+                    # has been tried.
+                    log.error("[%s]   %s %d — bad credential, trying next key: %s",
+                              trace_id, name, resp.status_code, resp.text[:200])
+                    if _ == attempts - 1:
+                        failed_providers.add(name)
+                    continue
+
+                if resp.status_code == 400:
+                    stats.record_error(name)
+                    # request-specific — NOT a provider health failure,
                     # but this request will not succeed here: exclude it.
                     failed_providers.add(name)
                     log.error("[%s]   %s %d — skipping provider: %s",
