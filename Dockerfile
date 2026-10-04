@@ -6,6 +6,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY cascade.py .
+COPY cascade_lib/ cascade_lib/
 
 EXPOSE 8319
 

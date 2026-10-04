@@ -10,6 +10,7 @@ import json
 import threading
 import time
 from collections import OrderedDict
+from copy import deepcopy
 
 
 class ResponseCache:
@@ -47,7 +48,7 @@ class ResponseCache:
 
         Returns the cached dict if found and not expired, else None.
         """
-        if self.ttl <= 0:
+        if self.ttl <= 0 or self.max_size <= 0:
             return None
         key = self._hash(payload)
         with self.lock:
@@ -56,20 +57,21 @@ class ResponseCache:
                 if time.time() - ts < self.ttl:
                     self._store.move_to_end(key)
                     self.hits += 1
-                    return data
+                    return deepcopy(data)
                 del self._store[key]
             self.misses += 1
         return None
 
     def set(self, payload: dict, data: dict) -> None:
         """Store a response in the cache."""
-        if self.ttl <= 0:
+        if self.ttl <= 0 or self.max_size <= 0:
             return
         key = self._hash(payload)
         with self.lock:
-            if len(self._store) >= self.max_size:
+            if key not in self._store and len(self._store) >= self.max_size:
                 self._store.popitem(last=False)
-            self._store[key] = (data, time.time())
+            self._store[key] = (deepcopy(data), time.time())
+            self._store.move_to_end(key)
 
     @property
     def size(self) -> int:

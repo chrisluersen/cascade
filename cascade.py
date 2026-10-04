@@ -31,16 +31,16 @@ import datetime as _dt
 import time
 import threading
 import logging
-import hashlib
 import hmac
 import itertools
 import uuid as _uuid
 import subprocess
 import shutil
 from pathlib import Path
-from collections import deque, OrderedDict
+from collections import deque
 from flask import Flask, request, jsonify, Response, stream_with_context
 import requests
+from cascade_lib.cache import ResponseCache
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
@@ -1694,65 +1694,6 @@ class ProviderStats:
 stats = ProviderStats()
 
 # ── Response cache ─────────────────────────────────────────────────────────────
-
-class ResponseCache:
-    """
-    In-memory LRU cache for non-streaming responses.
-    Identical requests (same model + messages) return a cached copy,
-    saving free-tier quota for novel queries.
-    Set CACHE_TTL_SECONDS=0 to disable.
-    """
-
-    def __init__(self, ttl: int = 300, max_size: int = 100):
-        self.ttl      = ttl
-        self.max_size = max_size
-        self.lock     = threading.Lock()
-        self._store: OrderedDict = OrderedDict()  # hash -> (data, timestamp)
-        self.hits     = 0
-        self.misses   = 0
-
-    def _hash(self, payload: dict) -> str:
-        # Hash the entire request (minus "stream", which doesn't change the
-        # answer) so requests differing only in temperature, max_tokens,
-        # tools, response_format, etc. never collide.
-        relevant = {k: v for k, v in payload.items() if k != "stream"}
-        content = json.dumps(relevant, sort_keys=True, default=str)
-        return hashlib.sha256(content.encode()).hexdigest()[:16]
-
-    def get(self, payload: dict) -> dict | None:
-        if self.ttl <= 0:
-            return None
-        key = self._hash(payload)
-        with self.lock:
-            if key in self._store:
-                data, ts = self._store[key]
-                if time.time() - ts < self.ttl:
-                    self._store.move_to_end(key)
-                    self.hits += 1
-                    return data
-                del self._store[key]
-            self.misses += 1
-        return None
-
-    def set(self, payload: dict, data: dict):
-        if self.ttl <= 0:
-            return
-        key = self._hash(payload)
-        with self.lock:
-            if len(self._store) >= self.max_size:
-                self._store.popitem(last=False)  # evict oldest
-            self._store[key] = (data, time.time())
-
-    @property
-    def size(self) -> int:
-        with self.lock:
-            return len(self._store)
-
-    @property
-    def hit_rate(self) -> float:
-        total = self.hits + self.misses
-        return round(self.hits / total, 3) if total else 0.0
-
 
 cache = ResponseCache(ttl=CACHE_TTL, max_size=CACHE_MAX_SIZE)
 
