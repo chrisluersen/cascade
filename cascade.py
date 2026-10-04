@@ -1334,8 +1334,9 @@ def classify_complexity(messages: list) -> int:
 
 def _get_smart_ordered(providers: list, complexity: int, est_tokens: int = 0) -> list:
     """
-    Sort providers for this complexity: cheapest capable model first, then
-    overkill models, then too-weak as last resort. Never blocks.
+    Sort providers for this complexity: capable candidates first; cost first
+    within each capability tier; weaker fallback candidates remain last.
+    Never blocks.
 
     When FAST_ROUTE_THRESHOLD is set and the request is shorter than it,
     low-latency providers win ties between otherwise equally-ranked options.
@@ -1381,7 +1382,7 @@ def _get_smart_ordered(providers: list, complexity: int, est_tokens: int = 0) ->
         else:
             tier        = 1
             sort_within = rating - complexity   # too weak — closest first
-        return (cost, tier, sort_within,
+        return (tier, cost, sort_within,
                 breaker_open, health,
                 reasoning_boost,          # 0 = reasoning-capable AND complex task (promoted)
                 0 if avail else 1,         # available first
