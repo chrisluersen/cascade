@@ -658,6 +658,7 @@ def _build_providers() -> list[dict]:
 
 
     # --- sambanova_direct (direct SambaNova API, free tier — 20 RPM, 200K TPD) ---
+    # 401 invalid key 2026-10-04 — awaiting rotated key (plan Phase 5). Retained, not deleted.
     sambanova_direct_keys = _keys_for("sambanova", "SAMBANOVA_DIRECT_API_KEY")
     if sambanova_direct_keys:
         providers.append({
@@ -924,6 +925,7 @@ def _build_providers() -> list[dict]:
         })
 
     # --- deepinfra (free, Qwen2.5-72B-Instruct) ---
+    # 402 "needs positive balance" 2026-10-04 — free tier gone; kept for top-up.
     deepinfra_keys = _keys_for("deepinfra", "DEEPINFRA_API_KEYS")
     if deepinfra_keys:
         providers.append({
@@ -935,6 +937,7 @@ def _build_providers() -> list[dict]:
         })
 
     # --- fireworks (free, Qwen2.5-Coder-32B-Instruct) ---
+    # 404 "Model not found" 2026-10-04 — model id retired.
     fireworks_keys = _keys_for("fireworks", "FIREWORKS_API_KEYS")
     if fireworks_keys:
         providers.append({
@@ -957,6 +960,7 @@ def _build_providers() -> list[dict]:
         })
 
     # ── LLM7.io (paid — free tier discontinued; devstral-small-2:24b ~lowest cost) ──
+    # 400 "model currently unavailable" 2026-10-04 — model id may have moved.
     llm7_keys = _keys_for("llm7", "LLM7_API_KEY")
     if llm7_keys:
         providers.append({
@@ -992,6 +996,7 @@ def _build_providers() -> list[dict]:
         })
 
     # ── LongCat (permanent free tier — 55M tokens/day) ──────────────────
+    # 402 "insufficient token quota" 2026-10-04 — kept for quota reset/top-up.
     longcat_keys = _keys_for("longcat", "LONGCAT_API_KEY")
     if longcat_keys:
         providers.append({
@@ -1003,6 +1008,7 @@ def _build_providers() -> list[dict]:
         })
 
     # ── SiliconFlow (free — DeepSeek-V2.5, 30 RPM, 60K TPM) ────────────────────
+    # 401 invalid token 2026-10-04 — awaiting rotated key (plan Phase 5). Retained, not deleted.
     siliconflow_keys = _keys_for("siliconflow", "SILICONFLOW_API_KEY")
     if siliconflow_keys:
         providers.append({
