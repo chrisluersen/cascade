@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+- Normalize Anthropic return values and consolidate response caching, with
+  detached request identities scoped to endpoint family and free-only policy.
+- Match model prices by exact ID; unknown estimates are unpriced, not free.
+  Free-only routing can lose previously substring-matched aliases until exact
+  prices are verified. Prices remain model-only, account-dependent estimates.
+- Prefer capability tier before cost tier while keeping weaker fallbacks and
+  existing explicit-pin behavior. This can increase paid use and requires
+  deployment owner acceptance; heuristic ranking is not a quality benchmark.
+- Fail closed for modern tool requests without probed or explicitly overridden
+  tool support (503 when no eligible candidate remains). Unknown tool support
+  now fails closed; legacy function fields are outside this check.
+- Tool overrides apply only on keyed startup probe passes; fresh complete persisted
+  state skips them, so restart alone does not apply changed overrides. Triggering
+  probes needs separate deployment/spend approval (quota and charges possible).
+- Add deterministic offline tests and an offline accepted-task evaluation CLI.
+  Receipt completeness and quality are caller judgments, not CLI certification;
+  no live provider, paid model/topology, Docker runtime, or deployment
+  verification is implied.
+
 ## v0.1.0 — 2026-07-04
 
 Initial public release.
