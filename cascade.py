@@ -449,10 +449,10 @@ _BW_ENV_ALIASES: dict[str, str] = {
 }
 # Circuit-breaker knobs — a provider that fails health repeatedly is tripped out
 # of rotation for a cooldown, then probed again (half-open). Overridable via env.
-BREAKER_WINDOW      = int(os.environ.get("BREAKER_WINDOW", 8))          # recent outcomes to weigh
-BREAKER_MIN_SAMPLES = int(os.environ.get("BREAKER_MIN_SAMPLES", 4))     # min samples before it can trip
-BREAKER_ERROR_RATE  = float(os.environ.get("BREAKER_ERROR_RATE", 0.5))  # trip at >= this health-fail fraction
-BREAKER_COOLDOWN    = int(os.environ.get("BREAKER_COOLDOWN", 60))       # seconds the breaker stays open
+BREAKER_WINDOW      = int(os.environ.get("BREAKER_WINDOW", 10))         # recent outcomes to weigh
+BREAKER_MIN_SAMPLES = int(os.environ.get("BREAKER_MIN_SAMPLES", 3))     # min samples before it can trip
+BREAKER_ERROR_RATE  = float(os.environ.get("BREAKER_ERROR_RATE", 0.4))  # trip at >= this health-fail fraction
+BREAKER_COOLDOWN    = int(os.environ.get("BREAKER_COOLDOWN", 120))      # seconds the breaker stays open
 
 # Providers known for low-latency inference — promoted for short requests
 _FAST_PROVIDERS = {"groq", "zai", "gemini",
@@ -2571,12 +2571,12 @@ def _route_completion(payload: dict, streaming: bool):
                 if resp.status_code in (401, 403):
                     stats.record_error(name)
                     # Auth-specific to THIS credential. Another key is a different
-                    # credential (same reasoning as 429), so rotate instead of
-                    # aborting: a stale secret must not shadow a good one for the
-                    # same provider. Mark the provider failed only once every key
-                    # has been tried.
-                    log.error("[%s]   %s %d — bad credential, trying next key: %s",
+                    # credential (same reasoning as 429), so cool this key and rotate
+                    # instead of aborting: a stale secret must not shadow a good one
+                    # for the same provider, and it must not be retried every request.
+                    log.error("[%s]   %s %d — bad credential, cooling key + trying next: %s",
                               trace_id, name, resp.status_code, resp.text[:200])
+                    pool.mark_rate_limited(name, key, retry_after=300)
                     if _ == attempts - 1:
                         failed_providers.add(name)
                     continue
