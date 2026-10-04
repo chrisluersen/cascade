@@ -183,11 +183,7 @@ KNOWN_MODEL_COSTS: dict = {
     "aion-2.5":                     (0.0,    0.0),      # aion free
 
     # OpenRouter models (shared key, various pricing)
-    "cohere/command-a-03-2025":     (0.0,    0.0),      # free tier
-    "mistral/mistral-medium-latest":(0.0,    0.0),      # free tier
-    "cerebras/gpt-oss-120b":        (0.0,    0.0),      # free tier
-    "sambanova/DeepSeek-V3.2":      (0.0,    0.0),      # free tier
-    "nvidia/deepseek-ai/deepseek-v4-flash": (0.0, 0.0), # free on OR
+
 
     # Paid OpenRouter models
     "deepseek/deepseek-v4-pro":     (0.435,  0.87),     # frontier
