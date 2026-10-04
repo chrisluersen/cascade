@@ -1356,8 +1356,15 @@ def _initialize_ratings(providers: list, pool_ref):
             new_state[name] = {"rating": _rate_model(p["model"]), "model": p["model"],
                                 "available": False, "latency_ms": 0, "overridden": False}
             continue
+        # Try every key — a stale secret must not hide a good one for the same
+        # provider (measured 2026-10-04: GROQ_API_KEYS=401 vs GROQ_API_KEY=200).
         key = probe[0]["key"]
-        ok, latency, actual = _probe_provider(p, key)
+        ok, latency, actual = False, 0.0, p["model"]
+        for entry in probe:
+            key = entry["key"]
+            ok, latency, actual = _probe_provider(p, key)
+            if ok:
+                break
         original   = p["model"]
         overridden = actual != original
         if overridden:
