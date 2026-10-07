@@ -1,191 +1,235 @@
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/cascade-cover.png">
-  <img alt="cascade — intelligent AI request routing" src="docs/assets/cascade-cover.png" width="100%">
+  <img alt="cascade — capability-aware AI request routing" src="docs/assets/cascade-cover.png" width="100%">
 </picture>
 
 # cascade
 
-**A capability-aware AI router** — prefers capable candidates, then cost within that tier; weaker candidates remain fallbacks. Explicit model pins retain their existing behavior. Free-tier billing depends on provider, account, and quota configuration.
+**One local endpoint for multiple AI providers, with capability-aware routing and automatic failover.**
+
+cascade sits between your application and hosted or local language models. Connect through the OpenAI Chat Completions or Anthropic Messages API, configure the providers you want to use, and let cascade select eligible candidates, rotate credentials, and retry upstream failures.
 
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
-[![Python](https://img.shields.io/badge/python-3.11+-brightgreen)](#)
-[![Providers](https://img.shields.io/badge/providers-36_│_5_cost_tiers-8b5cf6)](#supported-providers)
-[![Dual SDK](https://img.shields.io/badge/SDK-OpenAI_∷_Anthropic-ff6b6b)](#quick-start)
-[![Key source](https://img.shields.io/badge/keys-Bitwarden_Secrets_Manager-3b82f6)](#bitwarden-integration)
-[![llm-router](https://img.shields.io/badge/topic-llm--router-4ade80)](#)
-[![ai-gateway](https://img.shields.io/badge/topic-ai--gateway-4ade80)](#)
-[![cost-optimization](https://img.shields.io/badge/topic-cost--optimization-4ade80)](#)
-[![failover](https://img.shields.io/badge/topic-failover-4ade80)](#)
+[![Python](https://img.shields.io/badge/python-3.11%2B-brightgreen)](#quick-start)
+[![API](https://img.shields.io/badge/API-OpenAI%20%2B%20Anthropic-ff6b6b)](#connect-your-application)
+
+[Quick start](#quick-start) · [Routing behavior](#how-routing-works) · [Providers](#supported-providers) · [Security](#configuration-and-security) · [Documentation](#documentation)
+
+> **Routing is not a billing guarantee.** By default, capability comes before cost, so a paid candidate can be selected even when a free candidate is available. Use the explicit [free-only policy](#free-only-requests) to exclude paid and unpriced models according to the configured price table; verify your provider's actual account and quota terms separately.
 
 ```mermaid
 flowchart LR
-    App[Your App]
-    C[cascade ✦]
-    F[Free Providers<br/>NVIDIA · Z.AI · Gemini · Groq<br/>SambaNova · GitHub Models · 16 more]
-    P[Cheap Providers<br/>DeepSeek · OpenAI · Anthropic<br/>OpenRouter · Mimo · 5 more]
-    L[Local<br/>Ollama]
-    App -->|"OpenAI / Anthropic SDK"| C
-    C -->|"capability, then cost"| F
-    C -->|"capability, then cost"| P
-    C -->|"fallback"| L
-    C -. "health failover →" .-> P
-    C -. "health failover →" .-> L
-    style C fill:#1e1b4b,stroke:#818cf8,color:#e0e7ff
-    style F fill:#0f172a,stroke:#22c55e,color:#bbf7d0
-    style P fill:#0f172a,stroke:#f59e0b,color:#fde68a
-    style L fill:#0f172a,stroke:#6366f1,color:#c7d2fe
+    App[Your application] -->|OpenAI or Anthropic API| Router[cascade]
+    Router --> Policy[Request policy and capability checks]
+    Policy --> Candidates[Ordered eligible candidates]
+    Candidates --> Hosted[Direct provider APIs]
+    Candidates --> Aggregator[OpenRouter]
+    Candidates --> Local[Ollama]
+    Hosted -.->|Failure: try another eligible candidate| Candidates
+    Aggregator -.->|Failure: try another eligible candidate| Candidates
 ```
 
-```
-⏺ One endpoint → provider candidates with failover
-🧠 Multi-dimensional sort key: capability tier before cost tier
-🔐 Credential sources include local configuration and optional secret-manager integration
-```
+## Quick start
 
-## Quick Start
+You need **Python 3.11+**, Git, and access to at least one configured provider. The example below uses an OpenAI provider key; it can incur charges. Bitwarden is optional.
+
+### 1. Install from source
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/chrisluersen/cascade/main/get.sh | bash
-cascade setup
+git clone https://github.com/chrisluersen/cascade.git
+cd cascade
+python -m venv .venv
 ```
 
-Then use any OpenAI SDK:
+Activate the environment for your shell:
+
+```bash
+# macOS / Linux (use python3 above if python is unavailable)
+source .venv/bin/activate
+```
+
+```powershell
+# Windows PowerShell
+.\.venv\Scripts\Activate.ps1
+```
+
+Then install the server dependencies:
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+### 2. Configure credentials
+
+Create a private `.env` file in the repository root with these settings, replacing both placeholders:
+
+```dotenv
+CASCADE_API_KEY=replace-with-a-long-random-proxy-key
+OPENAI_API_KEY=replace-with-your-provider-key
+CASCADE_BIND_HOST=127.0.0.1
+PORT=8319
+CASCADE_ROUTE_LOG=./cascade-routes.jsonl
+```
+
+- **Proxy key:** `CASCADE_API_KEY` authenticates your application to cascade. There is no built-in default key; `sk-cascade-1` from older examples is not automatically accepted.
+- **Provider key:** `OPENAI_API_KEY` authenticates cascade to the upstream provider. Other provider variables and model overrides are described in [configuration](documentation/configuration.md).
+- Keep values unquoted in this file: cascade's minimal loader reads literal `KEY=value` pairs. Existing process environment values take precedence.
+- Do not commit `.env`, `auth.json`, or logs containing sensitive information.
+
+### 3. Start and check the server
+
+Run from the repository root so relative configuration paths resolve correctly:
+
+```bash
+python cascade.py
+```
+
+In another terminal:
+
+```bash
+curl http://127.0.0.1:8319/health
+```
+
+On Windows, use `curl.exe` if your shell aliases `curl` to another command. The health response reports `status: "ok"` and configured provider names. It confirms that the server is responding, **not** that an upstream inference request will succeed. Startup probes can contact configured providers.
+
+> **Installer caveat:** the repository includes `get.sh`, `install.sh`, and helper scripts, but their virtual-environment paths mix Unix and Windows layouts. The current `cascade.py` entry point does not dispatch `cascade setup`, `cascade start`, or the other previously documented CLI subcommands. Use the direct Python path above rather than those commands.
+
+## Connect your application
+
+Install the client library you use (`python -m pip install openai` or `python -m pip install anthropic`) in your application's environment. Set `CASCADE_API_KEY` in that application's environment to the same proxy key configured on the server. **The SDK examples do not load the server's `.env` file.**
+
+### OpenAI SDK
 
 ```python
+import os
 from openai import OpenAI
-client = OpenAI(base_url="http://localhost:8319/v1", api_key="sk-cascade-1")
-resp = client.chat.completions.create(model="cascade", messages=[{"role": "user", "content": "Hello!"}])
+
+client = OpenAI(
+    base_url="http://127.0.0.1:8319/v1",
+    api_key=os.environ["CASCADE_API_KEY"],
+)
+response = client.chat.completions.create(
+    model="cascade",
+    messages=[{"role": "user", "content": "Hello!"}],
+    max_tokens=256,
+)
+print(response.choices[0].message.content)
 ```
 
-Or Anthropic SDK — same endpoint:
+### Anthropic SDK
 
 ```python
-import anthropic
-client = anthropic.Anthropic(api_key="sk-cascade-1", base_url="http://localhost:8319")
-msg = client.messages.create(model="claude-sonnet-5", max_tokens=100, messages=[{"role": "user", "content": "Hello!"}])
+import os
+from anthropic import Anthropic
+
+client = Anthropic(
+    base_url="http://127.0.0.1:8319",
+    api_key=os.environ["CASCADE_API_KEY"],
+)
+response = client.messages.create(
+    model="cascade",
+    max_tokens=256,
+    messages=[{"role": "user", "content": "Hello!"}],
+)
+for block in response.content:
+    if block.type == "text":
+        print(block.text)
 ```
 
-> **cascade speaks both SDKs natively.** Transparently translates between `/v1/messages` (Anthropic) and `/v1/chat/completions` (OpenAI), including tool calls and thinking fields. No client changes needed.
+`cascade` is the default routing alias, not an upstream model name. The Anthropic endpoint translates requests and responses; using that SDK does not mean Claude will serve the request. Streaming and tool-call translation are supported, but full parity with every SDK feature is not guaranteed. This is not an OpenAI Responses API endpoint.
 
-## Why cascade?
+### Free-only requests
 
-Free LLM tiers are generous but unreliable — rate limits, deprecations, and outages are the norm. Paid APIs deliver but cost real money. cascade sits between your app and every major LLM, making the routing decision per-request:
+For chat requests, change `model="cascade"` to **`model="cascade-free"`**. Alternatively, add this header to a chat or embeddings request:
 
-**Prefers capable candidates, then cost within that tier; weaker candidates remain fallbacks.** If a candidate is unavailable or cannot handle the request, cascade tries other eligible candidates. This heuristic does not prove response quality; paid use can increase even while free candidates remain. Free-only routing is an explicit request policy, subject to the configured model prices and the provider's actual billing terms.
+```http
+X-Cascade-Free-Only: true
+```
 
-**The goal:** one endpoint with candidate failover. Validate cost and provider behavior for your own deployment before relying on free-tier routing.
+The policy is request-scoped. Candidates must have a zero-cost provider tier and an exact zero-input/zero-output-cost model entry in the configured price table to qualify; unknown model IDs are not treated as free. When no eligible candidate can serve the request, cascade returns **503** instead of falling through to a paid model. A deployment configured only with paid models will therefore reject free-only requests.
 
-## Features
+## How routing works
 
-| | |
+The server is implemented in [`cascade.py`](cascade.py), with support modules in [`cascade_lib/`](cascade_lib/), using Flask and Waitress.
+
+1. **Authenticate** using the proxy key, supplied as a Bearer token or `x-api-key`.
+2. **Check the cache** for non-streaming requests, scoped by endpoint family and free-only policy.
+3. **Apply routing preferences** using request complexity, keyword rules, and configured model matches. Prompt rules can alter model selection; do not treat a model name alone as a strict isolation policy.
+4. **Order eligible candidates** by capability tier before cost, with further routing preferences and weaker candidates retained as fallbacks. Free-only and tool-support checks constrain eligibility.
+5. **Attempt and fail over** with per-key cooldowns, provider circuit breakers, and payload-limit handling. Authentication failures can rotate to another key; provider failures move to another candidate.
+6. **Return a response or an error.** Detected error objects inside successful HTTP responses, including the first SSE data event, trigger failover before a response is handed to the client. This does not guarantee recovery from errors later in an already-started stream.
+
+Capability scores and prices are configured heuristics, not quality benchmarks or live billing data. Failover improves resilience; it cannot guarantee an answer when every eligible provider fails.
+
+## Features and boundaries
+
+| Feature | Behavior |
 |---|---|
-| **Provider catalog** | Configured free, paid, and local candidates; availability and quotas vary |
-| **Multi-dimensional routing** | Capability tier before cost tier; cost is preferred within a capability tier, with weaker fallback candidates |
-| **Bitwarden Secrets Manager** | Optional secret source alongside local credential configuration |
-| **Dual API support** | OpenAI **and** Anthropic SDK — plug-and-play, no client changes |
-| **Prompt-based routing** | Keyword-matched model pinning (code→DeepSeek, creative→GPT-4o, reasoning→Claude) |
-| **Smart complexity routing** | Request scored 1–5, matched to capability-rated models (1=outstanding, 5=basic) |
-| **Credential pooling** | Multiple API keys per provider, round-robin with per-key rate-limit cooldown |
-| **Circuit breaker** | Unhealthy providers auto-removed from rotation, re-probed after configurable cooldown |
-| **Response caching** | In-memory LRU cache (TTL-based), scoped by endpoint and free-only policy; restart after routing or catalog changes |
-| **Adaptive max_tokens** | Auto-scales output budget by input length — short queries get small budgets |
-| **Tool-aware routing** | Nonempty modern `tools` requests require probed support or an explicit operator override; absent support returns 503 |
-| **Payload ceiling detection** | Skips providers whose context/output limits a request would exceed |
-| **Reasoning model support** | Extra token headroom for thinking models + transparent `thinking` field handling + per-provider `reasoning_effort` control (`<PROVIDER>_REASONING_EFFORT`) |
-| **Embeddings routing** | Multi-provider failover — Gemini, Mistral, OpenAI, Cohere |
-| **Model auto-discovery** | Probes `/v1/models` endpoint at startup, fixes stale or renamed models |
-| **Anthropic ↔ OpenAI translation** | Transparent protocol bridge with tool-call mapping |
-| **Observability** | Prometheus `/metrics`, `/v1/status` dashboard, per-provider latency stats |
-| **Key management** | Auth via `auth.json` CLI or Bitwarden — zero plaintext keys in config |
+| Dual API surface | OpenAI Chat Completions and Anthropic Messages, including streaming and tool-call translation |
+| Credential pooling | Multiple keys per provider, key rotation, and cooldowns for rate limits or invalid credentials |
+| Tool-aware routing | Nonempty `tools` requests require probed support or an explicit operator override; no eligible support returns 503 |
+| Response caching | In-memory LRU with TTL; restart after routing, catalog, or policy changes to discard old entries |
+| Payload management | Adaptive output budgets, provider context/output ceilings, and reasoning-field handling |
+| Embeddings | Failover across configured embedding providers; vector dimensions and semantics can differ between models |
+| Observability | Provider health, latency, cache statistics, estimated costs, Prometheus metrics, and route traces |
 
-## Architecture
+## Supported providers
 
-A main server module (`cascade.py`) plus support libraries (`cascade_lib/`) running Flask/Waitress. One request flows through:
+The source catalog includes direct integrations such as **OpenAI, Anthropic, Gemini, Groq, NVIDIA NIM, SambaNova, Z.AI, DeepInfra, Fireworks, Together, and Hugging Face**, plus **OpenRouter** candidates and **Ollama** for local inference.
 
-```
-  ┌──────────┐   OpenAI-format request    ┌──────────────────────────────────────────────┐
-  │ Your app │ ─────────────────────────► │                  cascade                      │
-  └──────────┘   Bearer PROXY_API_KEYS    │                                              │
-       ▲                                   │  1. Auth check (constant-time token compare)  │
-       │                                   │  2. Cache lookup (SHA-256, LRU eviction)     │
-       │         OpenAI-format response    │  3. Complexity scoring (1–5 heuristic)        │
-       └────────────────────────────────► │  4. Prompt-route keyword matching             │
-                                           │  5. Provider ordering (11-dimension sort key) │
-                                           │  6. Failover loop (key rotation → cascade)   │
-                                           └──────────────────────┬───────────────────────┘
-                                                                  │ first successful response
-                                          ┌───────────────────────▼───────────────────────┐
-                                          │ nvidia_nim  zai  gemini  sambanova_direct    │
-                                          │ groq  github  deepinfra  fireworks  naga     │
-                                          │ together  ovhcloud  aion  longcat  ...        │
-                                          │ openrouter → deepseek-v4  sonnet-5  glm-5.2   │
-                                          └───────────────────────────────────────────────┘
-```
+Only configured candidates participate. Availability depends on credentials, account access, model IDs, quotas, and health checks—not the size of the catalog. See the [provider guide](documentation/providers.md) for setup pointers and [`_build_providers()`](cascade.py) for the current configured defaults. Verify model availability and pricing with your provider before deployment.
 
-**Request lifecycle:**
-1. **Auth** — constant-time token check against `PROXY_API_KEYS`
-2. **Cache** — SHA-256 keyed LRU cache (identical requests skip routing)
-3. **Score complexity** — 1 (critical) to 5 (trivial) based on token count and keywords
-4. **Pin by prompt** — optional keyword routing (code, creative, debug, complex engineering)
-5. **Sort providers** — capability tier → cost tier → further routing preferences; explicit pins retain their existing behavior and weaker candidates remain fallbacks
-6. **Failover loop** — try each provider in order, rotate keys on rate-limit, cool down on error
-7. **Return** — first successful response. If all exhausted, `All providers exhausted`
+## Configuration and security
 
-## Supported Providers
+- **Keep the two kinds of keys separate.** Clients receive the cascade proxy key, not upstream provider credentials. `CASCADE_API_KEY` can contain comma-separated proxy keys; Bitwarden can also supply a proxy key.
+- **Provider credentials are merged, not exclusive overrides.** The lookup order is `auth.json` → Bitwarden Secrets Manager → environment, with duplicates removed and order preserved. A key in `auth.json` does not disable keys from other sources.
+- **Bitwarden is optional.** Startup loading requires the `bws` CLI and `BWS_ACCESS_TOKEN`. Local `.env` and `auth.json` files are plaintext; protect their permissions and keep them out of version control.
+- **Review inherited configuration.** If `BWS_ACCESS_TOKEN` is unset, startup also attempts to load `~/AppData/Local/hermes/.env`. Check the deployment's environment and credential sources before starting it.
+- **Bind locally by default.** `CASCADE_BIND_HOST` defaults to `127.0.0.1`. If exposing the service remotely, add TLS and appropriate network access controls; the server itself serves HTTP.
+- **Do not assume tenant isolation.** The response cache does not promise per-user isolation. Review caching and logging before serving mutually untrusted clients.
 
-| Tier | Providers | Cost |
-|------|-----------|------|
-| **Free** | NVIDIA NIM, Z.AI, Gemini, SambaNova Direct, Groq, GitHub Models, DeepInfra, Fireworks, Naga, OVHcloud, Aion, LongCat, SiliconFlow, HuggingFace, and selected OpenRouter models | Configured free tier; verify account and quota |
-| **Cheap** | DeepSeek V4 Flash ($0.098/M), Hy3 Preview ($0.063/M, cheapest reasoning), OpenAI (gpt-4o-mini), Mimo V2.5 ($0.105/M, 1M context), Minimax-M3 ($0.30/M, 1M context), LLM7 (devstral-small-2), Together (paid tier), Anthropic (Claude Haiku 4.5) | $0.06–$0.30/M |
-| **Premium** | DeepSeek V4 Pro ($0.435/M), GLM-5.2 ($0.93/M), Claude Sonnet 5 ($2/M), Claude Sonnet 4.6 ($3/M) | $0.44–$3/M |
-| **Local** | Ollama (local model) | Local compute; not an upstream billing guarantee |
+See [configuration](documentation/configuration.md) for provider variables and [development notes](documentation/development.md) for cache and offline-mode boundaries.
 
-Provider/model names and prices above reflect existing configuration, not a fresh provider certification or live benchmark. Exact model IDs must be present in the price table for free-only eligibility; unknown aliases are unpriced, not free. Previously substring-matched aliases can drop out of free-only routing until an exact entry is verified.
+## Health and troubleshooting
 
-## Bitwarden Integration
+| Endpoint | Purpose | Authentication |
+|---|---|---|
+| `GET /health` | Server liveness and configured provider names | None |
+| `GET /v1/models` | Configured routing alias, not the full upstream catalog | Proxy key |
+| `GET /v1/status` | Provider state and runtime statistics | Proxy key |
+| `GET /metrics` | Prometheus metrics | None by default; set `METRICS_REQUIRE_AUTH=1` to require the proxy key |
 
-cascade can load API keys from **Bitwarden Secrets Manager** at startup via the `bws` CLI when configured. Local `auth.json` and environment-based credentials are also supported; protect them appropriately.
+- **401 Unauthorized:** ensure the client key matches a configured `CASCADE_API_KEY`. The old example key is not a default.
+- **503 / all providers exhausted:** check provider credentials, model access, quotas, cooldowns, and server logs. A successful `/health` response is not proof of provider readiness.
+- **503 on free-only or tool requests:** confirm at least one configured candidate satisfies that policy. Do not remove the policy unless you intend to permit different cost or capability behavior.
+- **Configuration changes not taking effect:** check inherited environment values, then stop and restart `python cascade.py`. This also clears the in-memory response cache.
 
-```
-Configured keys → eligible provider candidates
+## Development
+
+Use your approved Python environment with the runtime dependencies and `pytest` available, then run:
+
+```bash
+python -m pytest -q
 ```
 
-**Key resolution cascade:**
-1. `auth.json` (manual override via `cascade auth add`)
-2. Bitwarden (when configured)
-3. `.env` / system environment (legacy fallback)
-
-Key names are resolved through three strategies: exact match → singular form (strip trailing 'S') → alias table (`_BW_ENV_ALIASES`), bridging gaps between Bitwarden key names and cascade's internal env var names. All sources are deduped and order-preserved. See [configuration](documentation/configuration.md) for key settings.
-
-## Commands
-
-| Command | Action |
-|---|---|
-| `cascade setup` | Interactive first-run: add keys, verify, start |
-| `cascade start` | Start the server |
-| `cascade status` | Live dashboard — per-provider health, latency, cache stats |
-| `cascade auth add <provider>` | Add API keys for a provider |
-| `cascade auth list` | Show all configured keys |
-| `cascade model list` | Show active models per provider |
-| `cascade model set <provider> <model>` | Override a provider's model |
-| `cascade model reset <provider>` | Revert to default model |
-| `cascade restart` | Reload config and keys |
-| `cascade doctor` | Diagnose installation |
-| `cascade update` | Update to the latest version |
-| `cascade version` | Show installed version |
+Default collection targets `tests/`. Its router fixture uses `CASCADE_OFFLINE=1`, synthetic credentials, and blocked HTTP requests. The root-level `test_cascade.py` and `test_route_log.py` are legacy probes, not offline test gates. Passing the offline suite does **not** verify live provider access, SDK compatibility, Docker deployment, or billing. See [development and verification](documentation/development.md) for the full procedure.
 
 ## Documentation
 
-- **[Getting started](documentation/getting-started.md)** — zero-to-running in 5 minutes
-- **[Usage](documentation/usage.md)** — OpenAI SDK, Anthropic SDK, tool use, embeddings
-- **[Configuration](documentation/configuration.md)** — `.env` settings, `auth.json`, model overrides
-- **[Providers](documentation/providers.md)** — sign-up links, capabilities, rate limits
-- **[Development and verification](documentation/development.md)** — deterministic offline suite and evaluation receipts
-- **[Monitoring](documentation/monitoring.md)** — `cascade status`, Prometheus `/metrics`, `/v1/status`
-- **[Build an agent](documentation/build-an-agent.md)** — chatbot → memory → tools
-- **[Concepts](documentation/concepts.md)** — plain-language glossary
-- **[Routing spec](documentation/routing-spec.md)** — provider cascade, timeouts, model selection
+| Guide | Contents |
+|---|---|
+| [Usage](documentation/usage.md) | SDK examples, tool use, and embeddings |
+| [Configuration](documentation/configuration.md) | Environment settings, credentials, and model overrides |
+| [Providers](documentation/providers.md) | Provider setup pointers and capabilities |
+| [Routing specification](documentation/routing-spec.md) | Selection, timeouts, and failover |
+| [Monitoring](documentation/monitoring.md) | Status and metrics |
+| [Development and verification](documentation/development.md) | Offline tests and evaluation receipts |
+| [Build an agent](documentation/build-an-agent.md) | Chat, memory, and tools |
+| [Concepts](documentation/concepts.md) | Plain-language glossary |
+| [Changelog](CHANGELOG.md) | Change history |
+
+Some guides still contain older CLI, default-key, or free-first examples. Use this README's quick start and routing/security notes when those examples conflict with current behavior.
 
 ## License
 
-MIT
+[MIT](LICENSE).
