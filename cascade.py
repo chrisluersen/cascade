@@ -1628,12 +1628,67 @@ def _strip_response(data: dict):
             _strip_message(choice["message"])
 
 
-def _streaming_generator(resp: requests.Response):
+def _extract_error_text(payload) -> str:
+    """Non-empty message when *payload* is an error object, else ``""``.
+
+    OpenRouter (and some proxies) commit HTTP 200 and put the real upstream failure in
+    the body — ``{"error": {"message": "Upstream error from Nvidia: ..."}}`` — instead of
+    returning a non-2xx. Treating that as success caches a poison body and hands the
+    client a healthy-looking 200 that the client then reads as a provider error.
+    """
+    if not isinstance(payload, dict):
+        return ""
+    err = payload.get("error")
+    if not err:
+        return ""
+    if isinstance(err, dict):
+        return str(err.get("message") or err.get("detail") or err)
+    return str(err)
+
+
+def _peek_stream_error(resp: requests.Response):
+    """Drain the head of an SSE stream just far enough to tell a real first event from an
+    in-band error, so a 200-with-error can be failed over BEFORE the client commits.
+
+    Returns ``(error_text, consumed_bytes)``: ``error_text`` is ``""`` when the head looks
+    like ordinary content, and ``consumed_bytes`` (everything drained) must be re-emitted by
+    the caller's generator so no byte is lost.
+    """
+    consumed = b""
+    buf = b""
+    try:
+        for raw in resp.iter_content(chunk_size=None):
+            consumed += raw or b""
+            buf += raw or b""
+            while b"\n" in buf:
+                line_bytes, buf = buf.split(b"\n", 1)
+                line = line_bytes.decode("utf-8", errors="replace").strip()
+                if not line or line.startswith(":") or line.startswith("event:"):
+                    continue
+                if line.startswith("data:"):
+                    payload = line[5:].strip()
+                    if not payload or payload == "[DONE]":
+                        return ("", consumed)
+                    try:
+                        event = json.loads(payload)
+                    except Exception:
+                        return ("", consumed)          # not JSON — ordinary content
+                    return (_extract_error_text(event), consumed)
+                return ("", consumed)                  # unexpected line — treat as content
+            if len(consumed) > 65536:
+                break
+    except Exception as exc:                            # network hiccup mid-head
+        return (f"stream read error: {exc}", consumed)
+    return ("", consumed)
+
+
+def _streaming_generator(resp: requests.Response, prefetched: bytes = b""):
     """
     Yield SSE chunks with thinking fields stripped from delta objects.
     Buffers by newline to handle chunks that split across SSE boundaries.
+    ``prefetched`` re-emits head bytes already drained by ``_peek_stream_error``.
     """
-    buf = b""
+    buf = prefetched
     for raw_chunk in resp.iter_content(chunk_size=None):
         buf += raw_chunk
         while b"\n" in buf:
@@ -1740,14 +1795,14 @@ def _from_anthropic_response(data: dict) -> dict:
     return out
 
 
-def _anthropic_streaming_generator(resp: requests.Response):
+def _anthropic_streaming_generator(resp: requests.Response, prefetched: bytes = b""):
     """Translate Anthropic SSE stream to OpenAI SSE format token-by-token."""
     msg_id       = f"chatcmpl-{int(time.time())}"
     model        = ""
     created      = int(time.time())
     finish_reason = "stop"
 
-    buf = b""
+    buf = prefetched
     for raw_chunk in resp.iter_content(chunk_size=None):
         buf += raw_chunk
         while b"\n" in buf:
@@ -2608,6 +2663,30 @@ def _route_completion(payload: dict, streaming: bool):
                     log.warning("[%s]   %s unexpected %d — skipping provider", trace_id, name, resp.status_code)
                     break
 
+                # ── 2xx-with-error guard ────────────────────────────────────────────
+                # A 2xx is not proof of success: OpenRouter's free tier commits 200 and then
+                # reports the upstream failure in the body (non-stream) or in the FIRST SSE
+                # event (stream) — e.g. "Upstream error from Nvidia: Service temporarily
+                # overloaded". Left unhandled, cascade counts it as a success, caches a poison
+                # body, and hands the client a healthy-looking 200 that the client rightly reads
+                # as a provider error and re-routes on. Peek and fail over instead.
+                is_anthropic = provider.get("protocol") == "anthropic"
+                _prefetched = b""
+                if streaming:
+                    _err_text, _prefetched = _peek_stream_error(resp)
+                else:
+                    try:
+                        _err_text = _extract_error_text(resp.json())
+                    except Exception:
+                        _err_text = ""
+                if _err_text:
+                    stats.record_error(name)
+                    stats.record_health(name, False)
+                    failed_providers.add(name)
+                    log.warning("[%s]   %s %d but error payload — cascading: %s",
+                                trace_id, name, resp.status_code, _err_text[:200])
+                    break
+
                 # Success
                 stats.record_success(name, elapsed)
                 stats.record_health(name, True)        # 2xx = healthy (half-open recovery)
@@ -2620,10 +2699,9 @@ def _route_completion(payload: dict, streaming: bool):
                     log.info("[%s]   ↻ clamped output — cascading to next provider for full response", trace_id)
                     break
 
-                is_anthropic = provider.get("protocol") == "anthropic"
                 if streaming:
-                    gen = (_anthropic_streaming_generator(resp) if is_anthropic
-                           else _streaming_generator(resp))
+                    gen = (_anthropic_streaming_generator(resp, _prefetched) if is_anthropic
+                           else _streaming_generator(resp, _prefetched))
                     _route_log(trace_id=trace_id, route=_route, outcome="ok",
                                model=provider.get("model", ""), provider=name,
                                free_only=free_only, streaming=True,
